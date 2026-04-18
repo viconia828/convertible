@@ -1,0 +1,27 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.py]
+charset = utf-8
+
+[*.md]
+charset = utf-8-bom
+
+[*.txt]
+charset = utf-8-bom
+
+[*.ps1]
+charset = utf-8-bom
+end_of_line = crlf
+
+[*.bat]
+charset = utf-8-bom
+end_of_line = crlf
+
+[*.cmd]
+charset = utf-8-bom
+end_of_line = crlf

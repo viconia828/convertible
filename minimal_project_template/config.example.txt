@@ -1,0 +1,7 @@
+﻿# Simple key=value config file
+# Save this file as UTF-8 with BOM if you want PowerShell-friendly Chinese text.
+
+project_name = demo
+output_folder = ./output
+enable_cache = true
+retry_count = 3

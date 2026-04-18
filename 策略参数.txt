@@ -1,0 +1,209 @@
+# 可转债多因子慢策略参数文件
+# 说明：
+# 1. 这里只保留用户需要调节的策略参数。
+# 2. meta、data、exports 等工程级配置已内置到代码，不在此暴露。
+# 3. 单次回测里随时间推进而偏移的参数，应在回测任务中临时覆盖，不回写本文件。
+
+[env]
+# 环境分位数计算窗口长度
+percentile_window = 252
+# 环境分位数最小有效样本数
+percentile_min_periods = 20
+# 权益环境平滑 EMA 窗口
+equity_ema_span = 20
+# 债券环境平滑 EMA 窗口
+bond_ema_span = 20
+# 趋势环境平滑 EMA 窗口
+trend_ema_span = 10
+# 年化换算交易日数
+annualization_days = 252
+# 缺失值或无足够样本时使用的中性分数
+neutral_score = 0.5
+
+[env.equity]
+# 沪深 300 动量观察窗口
+momentum_window = 60
+# 沪深 300 均线窗口
+above_ma_window = 120
+# 均线最小有效样本数
+above_ma_min_periods = 20
+# 成交额短窗口
+amount_short_window = 20
+# 成交额短窗口最小有效样本数
+amount_short_min_periods = 5
+# 成交额长窗口
+amount_long_window = 60
+# 成交额长窗口最小有效样本数
+amount_long_min_periods = 10
+# 成交额比值归一化下界
+amount_ratio_lower = 0.5
+# 成交额比值归一化上界
+amount_ratio_upper = 1.5
+# 权益动量信号权重
+momentum_weight = 0.4
+# 权益站上均线信号权重
+above_ma_weight = 0.3
+# 权益成交额活跃度信号权重
+amount_weight = 0.3
+
+[env.bond]
+# 国债收益率变化观察窗口
+yield_change_window = 60
+# 债券指数动量观察窗口
+bond_momentum_window = 20
+# 利率下行受益信号权重
+yield_change_weight = 0.4
+# 信用利差信号权重
+credit_spread_weight = 0.3
+# 债券指数动量信号权重
+bond_index_weight = 0.3
+
+[env.trend]
+# 近似 ADX 的观察窗口
+adx_period = 14
+# ADX 归一化缩放值
+adx_scale = 40.0
+# ADX 缺样本时的中性值
+adx_neutral_value = 20.0
+# 趋势均线窗口
+ma_window = 60
+# 趋势均线最小有效样本数
+ma_min_periods = 20
+# 趋势持续性观察窗口
+persist_window = 60
+# 趋势持续性最小有效样本数
+persist_min_periods = 20
+# 波动率观察窗口
+vol_window = 20
+# 波动率最小有效样本数
+vol_min_periods = 10
+# 趋势存在信号权重
+exist_weight = 0.4
+# 趋势持续信号权重
+persist_weight = 0.4
+# 趋势稳定信号权重
+stable_weight = 0.2
+
+[env.alignment.csi300]
+# 最多允许前值填充的交易日数
+max_forward_fill_days = 3
+# 是否为必需指标
+required = true
+
+[env.alignment.csi300_amount]
+# 最多允许前值填充的交易日数
+max_forward_fill_days = 3
+# 是否为必需指标
+required = true
+
+[env.alignment.bond_index]
+# 最多允许前值填充的交易日数
+max_forward_fill_days = 3
+# 是否为必需指标
+required = true
+
+[env.alignment.treasury_10y]
+# 最多允许前值填充的交易日数
+max_forward_fill_days = 3
+# 是否为必需指标
+required = true
+
+[env.alignment.credit_spread]
+# 最多允许前值填充的交易日数
+max_forward_fill_days = 3
+# 是否为必需指标
+required = true
+
+[env.alignment.cb_equal_weight]
+# 最多允许前值填充的交易日数
+max_forward_fill_days = 3
+# 是否为必需指标
+required = true
+
+[factor]
+# 结构因子的理想转股溢价率中心
+premium_center = 20.0
+# 结构因子的理想转股溢价率宽度
+premium_width = 15.0
+# 结构因子高斯衰减强度
+structure_gaussian_decay = 0.5
+# 最少上市交易日数
+min_listing_days = 30
+# 最小剩余规模阈值
+min_remain_size = 50000000.0
+# 近 20 日平均成交额下限，单位与 Tushare `cb_daily.amount` 一致（万元）
+min_avg_amount_20 = 200.0
+# winsor 截尾下界分位数
+winsor_lower = 0.01
+# winsor 截尾上界分位数
+winsor_upper = 0.99
+# 趋势因子动量窗口
+momentum_window = 60
+# 稳定因子波动率窗口
+volatility_window = 60
+# 波动率最小有效样本数
+volatility_min_periods = 20
+# 平均成交额窗口
+amount_mean_window = 20
+# 平均成交额最小有效样本数
+amount_mean_min_periods = 5
+# 年化换算交易日数
+annualization_days = 252
+# z-score 标准差自由度参数
+zscore_ddof = 0
+
+[model]
+# 单因子最小权重下限
+min_weight = 0.05
+# 单因子最大权重上限
+max_weight = 0.40
+# 权重平滑参数；1.0 表示不与上一期混合
+smooth_alpha = 1.0
+
+[model.base_weights]
+# 价值因子 baseline 权重
+value = 0.25
+# 票息因子 baseline 权重
+carry = 0.20
+# 结构因子 baseline 权重
+structure = 0.20
+# 趋势因子 baseline 权重
+trend = 0.20
+# 稳定因子 baseline 权重
+stability = 0.15
+
+[model.shift_matrix.equity_strength]
+# 权益环境增强时，价值因子权重偏移
+value = -0.05
+# 权益环境增强时，票息因子权重偏移
+carry = -0.03
+# 权益环境增强时，结构因子权重偏移
+structure = 0.00
+# 权益环境增强时，趋势因子权重偏移
+trend = 0.06
+# 权益环境增强时，稳定因子权重偏移
+stability = -0.03
+
+[model.shift_matrix.bond_strength]
+# 债券环境增强时，价值因子权重偏移
+value = 0.04
+# 债券环境增强时，票息因子权重偏移
+carry = 0.06
+# 债券环境增强时，结构因子权重偏移
+structure = 0.02
+# 债券环境增强时，趋势因子权重偏移
+trend = -0.03
+# 债券环境增强时，稳定因子权重偏移
+stability = -0.02
+
+[model.shift_matrix.trend_strength]
+# 趋势环境增强时，价值因子权重偏移
+value = -0.05
+# 趋势环境增强时，票息因子权重偏移
+carry = -0.02
+# 趋势环境增强时，结构因子权重偏移
+structure = 0.00
+# 趋势环境增强时，趋势因子权重偏移
+trend = 0.07
+# 趋势环境增强时，稳定因子权重偏移
+stability = -0.03

@@ -1,0 +1,7 @@
+{
+  "mode": "fresh",
+  "coverage_start": "2025-01-01",
+  "coverage_end": "2026-04-15",
+  "rows": 318,
+  "source_table": "chinabond_queryYz_10y_AA_minus_treasury"
+}
