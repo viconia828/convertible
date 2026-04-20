@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +17,27 @@ from factor import FactorEngine
 from strategy_config import StrategyParameters, load_strategy_parameters
 
 
+ENV_SUMMARY_INDICATOR_LABELS = {
+    "csi300": "沪深300指数",
+    "csi300_amount": "沪深300成交额",
+    "bond_index": "债券指数",
+    "treasury_10y": "10年期国债收益率",
+    "credit_spread": "信用利差",
+    "cb_equal_weight": "可转债等权指数",
+}
+
+FACTOR_EXCLUDE_REASON_LABELS = {
+    "missing_required_fields": "核心因子字段不足",
+    "recently_listed": "上市观察期不足",
+    "remain_size_below_min": "余额低于阈值",
+    "amount_below_min": "成交额低于阈值",
+    "call_announced": "已公告强赎",
+    "put_triggered": "已触发回售",
+    "not_tradable": "当日不可交易",
+    "missing_daily_history": "缺少日线历史",
+}
+
+
 @dataclass(frozen=True)
 class EnvironmentScoreReport:
     scores: pd.DataFrame
@@ -24,6 +46,9 @@ class EnvironmentScoreReport:
     requested_end: pd.Timestamp
     history_start_requested: pd.Timestamp
     history_start_used: pd.Timestamp
+    fetch_policy: str = "缓存优先，完整性优先"
+    refresh_requested: bool = False
+    data_quality_status: str = "正常"
     notes: tuple[str, ...] = ()
 
 
@@ -36,6 +61,9 @@ class FactorScoreReport:
     history_start_requested: pd.Timestamp
     history_start_used: pd.Timestamp
     codes: list[str]
+    fetch_policy: str = "缓存优先，完整性优先"
+    refresh_requested: bool = False
+    data_quality_status: str = "正常"
     notes: tuple[str, ...] = ()
 
 
@@ -88,11 +116,23 @@ def build_environment_score_report(
         _safe_min_timestamp(trading_calendar, "calendar_date"),
         _safe_min_timestamp(macro_daily, "trade_date"),
     )
+    expected_trade_days = trading_calendar.loc[
+        (trading_calendar["is_open"].astype("Int64") == 1)
+        & trading_calendar["calendar_date"].between(start_ts, end_ts),
+        "calendar_date",
+    ]
     notes = _build_history_notes(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         context="环境打分",
+    ) + _build_window_coverage_notes(
+        expected_dates=expected_trade_days,
+        actual_dates=window_scores["trade_date"],
+        context="环境打分",
     )
+    data_quality_status = "警告" if notes else "正常"
+    if data_quality_status == "警告":
+        notes = notes + (_data_quality_warning_note("环境打分"),)
     return EnvironmentScoreReport(
         scores=window_scores.reset_index(drop=True),
         summary=summary,
@@ -100,6 +140,8 @@ def build_environment_score_report(
         requested_end=end_ts,
         history_start_requested=history_start,
         history_start_used=history_start_used,
+        refresh_requested=bool(refresh),
+        data_quality_status=data_quality_status,
         notes=notes,
     )
 
@@ -135,24 +177,32 @@ def build_factor_score_report(
         )
 
     history_start = start_ts - pd.Timedelta(
-        days=config.exports.factor_history_buffer_calendar_days
+        days=_recommended_factor_history_buffer_calendar_days(config)
     )
     if not refresh:
         local_history_start = _local_factor_history_start(loader, normalized_codes)
         if local_history_start is not None and local_history_start <= start_ts:
             history_start = max(history_start, local_history_start)
-    cb_daily = loader.get_cb_daily(
-        normalized_codes,
+    cb_daily = loader.get_cb_daily_cross_section(
         history_start,
         end_ts,
         refresh=refresh,
-        enrich=True,
     )
     cb_basic = loader.get_cb_basic()
+    cb_rate = None
+    if not cb_daily.empty and cb_daily["ytm"].isna().any() and hasattr(loader, "get_cb_rate"):
+        universe_codes = (
+            cb_daily.loc[cb_daily["trade_date"].between(start_ts, end_ts), "cb_code"]
+            .dropna()
+            .astype(str)
+            .drop_duplicates()
+            .tolist()
+        )
+        if universe_codes:
+            cb_rate = loader.get_cb_rate(universe_codes, refresh=refresh)
     cb_call = loader.get_cb_call(
         history_start,
         end_ts,
-        codes=normalized_codes,
         refresh=refresh,
     )
     trading_calendar = loader.get_trading_calendar(
@@ -171,26 +221,17 @@ def build_factor_score_report(
     if not trade_days:
         raise ValueError("Requested window has no open trading days.")
 
-    diagnostics_frames: list[pd.DataFrame] = []
-    for trade_day in trade_days:
-        daily = engine.compute_with_diagnostics(
-            as_of_date=trade_day,
-            cb_daily=cb_daily,
-            cb_basic=cb_basic,
-            cb_call=cb_call,
-            requested_codes=normalized_codes,
-        )
-        diagnostics_frames.append(
-            engine.append_weighted_total_score(
-                daily,
-                factor_weights=config.model.base_weights,
-            )
-        )
-
-    diagnostics = (
-        pd.concat(diagnostics_frames, ignore_index=True)
-        if diagnostics_frames
-        else engine._empty_result(include_diagnostics=True)  # noqa: SLF001
+    diagnostics = engine.compute_panel_with_diagnostics(
+        trade_days=trade_days,
+        cb_daily=cb_daily,
+        cb_basic=cb_basic,
+        cb_call=cb_call,
+        cb_rate=cb_rate,
+        requested_codes=normalized_codes,
+    )
+    diagnostics = engine.append_weighted_total_score(
+        diagnostics,
+        factor_weights=config.model.base_weights,
     )
     scores = diagnostics.loc[
         :,
@@ -213,11 +254,20 @@ def build_factor_score_report(
         ],
     ].copy()
     history_start_used = _safe_min_timestamp(cb_daily, "trade_date")
-    notes = _build_history_notes(
+    history_notes = _build_history_notes(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         context="因子打分",
     )
+    diagnostic_notes = _build_factor_diagnostic_notes(diagnostics, normalized_codes)
+    data_quality_status = (
+        "警告"
+        if history_notes or _has_factor_data_completeness_issue(diagnostics)
+        else "正常"
+    )
+    notes = history_notes + diagnostic_notes
+    if data_quality_status == "警告":
+        notes = notes + (_data_quality_warning_note("因子打分"),)
     return FactorScoreReport(
         scores=scores.reset_index(drop=True),
         diagnostics=diagnostics.reset_index(drop=True),
@@ -226,6 +276,8 @@ def build_factor_score_report(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         codes=normalized_codes,
+        refresh_requested=bool(refresh),
+        data_quality_status=data_quality_status,
         notes=notes,
     )
 
@@ -248,38 +300,47 @@ def write_environment_score_xlsx(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     summary_rows = [
-        {"item": "report_type", "value": "environment_scores"},
-        {"item": "config_path", "value": str(config.path)},
-        {"item": "requested_start", "value": report.requested_start.strftime("%Y-%m-%d")},
-        {"item": "requested_end", "value": report.requested_end.strftime("%Y-%m-%d")},
-        {
-            "item": "history_start_requested",
-            "value": report.history_start_requested.strftime("%Y-%m-%d"),
-        },
-        {
-            "item": "history_start_used",
-            "value": report.history_start_used.strftime("%Y-%m-%d"),
-        },
-        {"item": "total_calendar_days", "value": report.summary.total_calendar_days},
-        {"item": "kept_days", "value": report.summary.kept_days},
-        {"item": "dropped_days", "value": report.summary.dropped_days},
+        _build_environment_summary_row("report_type", "environment_scores"),
+        _build_environment_summary_row("config_path", str(config.path)),
+        _build_environment_summary_row("fetch_policy", report.fetch_policy),
+        _build_environment_summary_row(
+            "refresh_requested",
+            "是" if report.refresh_requested else "否",
+        ),
+        _build_environment_summary_row("data_quality_status", report.data_quality_status),
+        _build_environment_summary_row(
+            "requested_start",
+            report.requested_start.strftime("%Y-%m-%d"),
+        ),
+        _build_environment_summary_row(
+            "requested_end",
+            report.requested_end.strftime("%Y-%m-%d"),
+        ),
+        _build_environment_summary_row(
+            "history_start_requested",
+            report.history_start_requested.strftime("%Y-%m-%d"),
+        ),
+        _build_environment_summary_row(
+            "history_start_used",
+            report.history_start_used.strftime("%Y-%m-%d"),
+        ),
+        _build_environment_summary_row(
+            "total_calendar_days",
+            report.summary.total_calendar_days,
+        ),
+        _build_environment_summary_row("kept_days", report.summary.kept_days),
+        _build_environment_summary_row("dropped_days", report.summary.dropped_days),
     ]
     summary_rows.extend(
-        {
-            "item": f"filled_days::{indicator}",
-            "value": value,
-        }
+        _build_environment_summary_row(f"filled_days::{indicator}", value)
         for indicator, value in report.summary.filled_days_by_indicator.items()
     )
     summary_rows.extend(
-        {
-            "item": f"invalid_days::{indicator}",
-            "value": value,
-        }
+        _build_environment_summary_row(f"invalid_days::{indicator}", value)
         for indicator, value in report.summary.invalid_days_by_indicator.items()
     )
     summary_rows.extend(
-        {"item": f"note::{index + 1}", "value": note}
+        _build_environment_summary_row(f"note::{index + 1}", note)
         for index, note in enumerate(report.notes)
     )
     summary = pd.DataFrame(summary_rows)
@@ -316,37 +377,60 @@ def write_factor_score_xlsx(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     summary_rows = [
-        {"item": "report_type", "value": "factor_scores"},
-        {"item": "config_path", "value": str(config.path)},
-        {"item": "requested_start", "value": report.requested_start.strftime("%Y-%m-%d")},
-        {"item": "requested_end", "value": report.requested_end.strftime("%Y-%m-%d")},
-        {
-            "item": "history_start_requested",
-            "value": report.history_start_requested.strftime("%Y-%m-%d"),
-        },
-        {
-            "item": "history_start_used",
-            "value": report.history_start_used.strftime("%Y-%m-%d"),
-        },
-        {"item": "codes", "value": ",".join(report.codes)},
-        {"item": "code_count", "value": len(report.codes)},
-        {
-            "item": "factor_max_codes_per_run",
-            "value": config.exports.factor_max_codes_per_run,
-        },
+        _build_factor_summary_row("report_type", "factor_scores"),
+        _build_factor_summary_row("config_path", str(config.path)),
+        _build_factor_summary_row("fetch_policy", report.fetch_policy),
+        _build_factor_summary_row(
+            "refresh_requested",
+            "是" if report.refresh_requested else "否",
+        ),
+        _build_factor_summary_row("data_quality_status", report.data_quality_status),
+        _build_factor_summary_row(
+            "requested_start",
+            report.requested_start.strftime("%Y-%m-%d"),
+        ),
+        _build_factor_summary_row(
+            "requested_end",
+            report.requested_end.strftime("%Y-%m-%d"),
+        ),
+        _build_factor_summary_row(
+            "history_start_requested",
+            report.history_start_requested.strftime("%Y-%m-%d"),
+        ),
+        _build_factor_summary_row(
+            "history_start_used",
+            report.history_start_used.strftime("%Y-%m-%d"),
+        ),
+        _build_factor_summary_row("codes", ",".join(report.codes)),
+        _build_factor_summary_row("code_count", len(report.codes)),
+        _build_factor_summary_row(
+            "factor_max_codes_per_run",
+            config.exports.factor_max_codes_per_run,
+        ),
     ]
     summary_rows.extend(
-        {"item": f"note::{index + 1}", "value": note}
+        _build_factor_summary_row(f"note::{index + 1}", note)
         for index, note in enumerate(report.notes)
     )
     summary = pd.DataFrame(summary_rows)
+    sheet_name_map = _build_factor_code_sheet_name_map(
+        codes=report.codes,
+        reserved_names=(
+            config.exports.diagnostics_sheet_name,
+            config.exports.summary_sheet_name,
+        ),
+    )
 
     with pd.ExcelWriter(path, engine=config.exports.excel_engine) as writer:
-        report.scores.to_excel(
-            writer,
-            sheet_name=config.exports.factor_sheet_name,
-            index=False,
-        )
+        for code in report.codes:
+            code_scores = report.scores.loc[report.scores["cb_code"] == code].copy()
+            if code_scores.empty:
+                code_scores = pd.DataFrame(columns=report.scores.columns)
+            code_scores.to_excel(
+                writer,
+                sheet_name=sheet_name_map[code],
+                index=False,
+            )
         report.diagnostics.to_excel(
             writer,
             sheet_name=config.exports.diagnostics_sheet_name,
@@ -395,12 +479,62 @@ def normalize_cb_codes(codes: str | Iterable[str]) -> list[str]:
     normalized = []
     seen: set[str] = set()
     for raw in raw_codes:
-        code = raw.strip().upper()
+        code = _normalize_single_cb_code(raw)
         if not code or code in seen:
             continue
         seen.add(code)
         normalized.append(code)
     return normalized
+
+
+def _normalize_single_cb_code(raw_code: object) -> str:
+    code = str(raw_code).strip().upper()
+    if not code:
+        return ""
+    if re.fullmatch(r"\d{6}", code):
+        # A-share convertible bonds usually use 11xxxx on SSE and 12xxxx on SZSE.
+        if code.startswith("11"):
+            return f"{code}.SH"
+        if code.startswith("12"):
+            return f"{code}.SZ"
+    return code
+
+
+def _build_factor_code_sheet_name_map(
+    codes: list[str],
+    reserved_names: tuple[str, ...] = (),
+) -> dict[str, str]:
+    taken = {name.casefold() for name in reserved_names}
+    mapping: dict[str, str] = {}
+    for code in codes:
+        mapping[code] = _make_unique_excel_sheet_name(
+            preferred_name=code,
+            taken_names=taken,
+        )
+        taken.add(mapping[code].casefold())
+    return mapping
+
+
+def _make_unique_excel_sheet_name(
+    preferred_name: str,
+    taken_names: set[str],
+) -> str:
+    sanitized = re.sub(r"[:\\/?*\[\]]", "_", str(preferred_name).strip())
+    sanitized = sanitized.strip("'")
+    if not sanitized:
+        sanitized = "code"
+    sanitized = sanitized[:31]
+
+    if sanitized.casefold() not in taken_names:
+        return sanitized
+
+    counter = 2
+    while True:
+        suffix = f"_{counter}"
+        candidate = f"{sanitized[: max(0, 31 - len(suffix))]}{suffix}"
+        if candidate.casefold() not in taken_names:
+            return candidate
+        counter += 1
 
 
 def _safe_min_timestamp(frame: pd.DataFrame, column: str) -> pd.Timestamp:
@@ -419,6 +553,25 @@ def _max_timestamp(*values: pd.Timestamp) -> pd.Timestamp:
     return max(cleaned)
 
 
+def _recommended_factor_history_buffer_calendar_days(
+    config: StrategyParameters,
+) -> int:
+    required_trading_days = max(
+        int(config.factor.momentum_window) + 1,
+        int(config.factor.volatility_window) + 1,
+        int(config.factor.amount_mean_window) + 1,
+        int(config.factor.min_listing_days) + 1,
+    )
+    derived_calendar_days = max(
+        60,
+        int(math.ceil(required_trading_days * 2.0)),
+    )
+    return min(
+        int(config.exports.factor_history_buffer_calendar_days),
+        derived_calendar_days,
+    )
+
+
 def _build_history_notes(
     history_start_requested: pd.Timestamp,
     history_start_used: pd.Timestamp,
@@ -429,6 +582,174 @@ def _build_history_notes(
     return (
         f"{context}预热窗口未完全覆盖，当前报告基于本地可用缓存或当前可得历史数据生成。",
         f"预热起点请求为 {history_start_requested.strftime('%Y-%m-%d')}，实际使用起点为 {history_start_used.strftime('%Y-%m-%d')}。",
+    )
+
+
+def _build_window_coverage_notes(
+    expected_dates: pd.Series | list[object],
+    actual_dates: pd.Series,
+    context: str,
+) -> tuple[str, ...]:
+    expected = pd.to_datetime(expected_dates, errors="coerce")
+    expected = pd.Series(expected).dropna().sort_values()
+    actual = pd.to_datetime(actual_dates, errors="coerce").dropna().sort_values()
+    if expected.empty or actual.empty:
+        return ()
+
+    notes: list[str] = []
+    expected_start = pd.Timestamp(expected.iloc[0]).normalize()
+    expected_end = pd.Timestamp(expected.iloc[-1]).normalize()
+    actual_start = pd.Timestamp(actual.iloc[0]).normalize()
+    actual_end = pd.Timestamp(actual.iloc[-1]).normalize()
+
+    if actual_start > expected_start:
+        notes.append(
+            f"{context}请求窗口内首个应输出交易日为 {expected_start.strftime('%Y-%m-%d')}，但当前报告首个可导出交易日为 {actual_start.strftime('%Y-%m-%d')}。"
+        )
+    if actual_end < expected_end:
+        notes.append(
+            f"{context}请求窗口内最后一个应输出交易日为 {expected_end.strftime('%Y-%m-%d')}，但当前报告最后一个可导出交易日为 {actual_end.strftime('%Y-%m-%d')}。"
+        )
+    if notes:
+        notes.append("这通常表示某个必需指标在部分日期缺少本地缓存，或刷新补数未成功。")
+    return tuple(notes)
+
+
+def _build_environment_summary_row(item: str, value: object) -> dict[str, object]:
+    return {
+        "item": item,
+        "value": value,
+        "comment": _environment_summary_comment(item),
+    }
+
+
+def _environment_summary_comment(item: str) -> str:
+    fixed_comments = {
+        "report_type": "报表类型标识，用于区分当前 XLSX 是环境打分导出结果。",
+        "config_path": "本次运行实际使用的策略参数文件绝对路径。",
+        "fetch_policy": "当前取数策略规则：优先复用缓存，但一旦发现数据覆盖不足，就优先补齐数据完整性。",
+        "refresh_requested": "本次是否启用了强制刷新模式；启用后会尽量重拉本次所需远端数据。",
+        "data_quality_status": "本次结果的数据质量状态；若为“警告”，表示当前计算结果可能受数据不完整影响。",
+        "requested_start": "用户本次输入的开始日期。",
+        "requested_end": "用户本次输入的结束日期。",
+        "history_start_requested": "按预热窗口规则向前回溯后，请求参与计算的预热起点。",
+        "history_start_used": "本次运行实际可用并参与环境计算的历史起点。",
+        "total_calendar_days": "参与本次环境对齐与计算的交易日历总天数，包含预热区间。",
+        "kept_days": "完成环境对齐后，所有必需指标都有效并被保留的交易日数量。",
+        "dropped_days": "完成环境对齐后，因必需指标缺失或超过填充上限而被剔除的交易日数量。",
+    }
+    if item in fixed_comments:
+        return fixed_comments[item]
+
+    if item.startswith("filled_days::"):
+        indicator = item.split("::", 1)[1]
+        label = ENV_SUMMARY_INDICATOR_LABELS.get(indicator, indicator)
+        return f"{label}在环境对齐时通过前值填充补齐的交易日数量。"
+
+    if item.startswith("invalid_days::"):
+        indicator = item.split("::", 1)[1]
+        label = ENV_SUMMARY_INDICATOR_LABELS.get(indicator, indicator)
+        return f"{label}在环境对齐时因缺失或超过填充上限而无效的交易日数量。"
+
+    if item.startswith("note::"):
+        return "本次导出附带的补充提示、边界说明或异常说明。"
+
+    return "本次环境打分导出中的运行摘要项。"
+
+
+def _build_factor_summary_row(item: str, value: object) -> dict[str, object]:
+    return {
+        "item": item,
+        "value": value,
+        "comment": _factor_summary_comment(item),
+    }
+
+
+def _factor_summary_comment(item: str) -> str:
+    fixed_comments = {
+        "report_type": "报表类型标识，用于区分当前 XLSX 是因子打分导出结果。",
+        "config_path": "本次运行实际使用的策略参数文件绝对路径。",
+        "fetch_policy": "当前取数策略规则：优先复用缓存，但一旦发现数据覆盖不足，就优先补齐数据完整性。",
+        "refresh_requested": "本次是否启用了强制刷新模式；启用后会尽量重拉本次所需远端数据。",
+        "data_quality_status": "本次结果的数据质量状态；若为“警告”，表示当前计算结果可能受数据不完整影响。",
+        "requested_start": "用户本次输入的开始日期。",
+        "requested_end": "用户本次输入的结束日期。",
+        "history_start_requested": "按预热窗口规则向前回溯后，请求参与计算的预热起点。",
+        "history_start_used": "本次运行实际取得并参与因子计算的历史起点。",
+        "codes": "本次请求导出的可转债代码列表，多个代码用逗号分隔。",
+        "code_count": "本次导出的可转债代码数量。",
+        "factor_max_codes_per_run": "当前配置允许单次因子打分导出的最大代码数量。",
+    }
+    if item in fixed_comments:
+        return fixed_comments[item]
+
+    if item.startswith("note::"):
+        return "本次导出附带的补充提示、边界说明或异常说明。"
+
+    return "本次因子打分导出中的运行摘要项。"
+
+
+def _build_factor_diagnostic_notes(
+    diagnostics: pd.DataFrame,
+    codes: list[str],
+) -> tuple[str, ...]:
+    if diagnostics.empty or "cb_code" not in diagnostics.columns:
+        return ()
+
+    notes: list[str] = []
+    for code in codes:
+        code_frame = diagnostics.loc[diagnostics["cb_code"] == code].copy()
+        if code_frame.empty:
+            notes.append(f"{code} 在请求窗口内没有生成任何因子诊断记录。")
+            continue
+
+        eligible_count = int(code_frame["eligible"].fillna(False).astype(bool).sum())
+        if eligible_count > 0:
+            continue
+
+        reasons = _summarize_factor_exclude_reasons(code_frame)
+        if reasons:
+            notes.append(f"{code} 在请求窗口内未产生可用因子分数，主要原因：{reasons}。")
+        else:
+            notes.append(f"{code} 在请求窗口内未产生可用因子分数。")
+    return tuple(notes)
+
+
+def _summarize_factor_exclude_reasons(frame: pd.DataFrame) -> str:
+    if "exclude_reason" not in frame.columns:
+        return ""
+
+    counts: dict[str, int] = {}
+    for raw in frame["exclude_reason"].fillna("").astype(str):
+        for reason in [part.strip() for part in raw.split(",") if part.strip()]:
+            counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return ""
+
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    parts = [
+        f"{FACTOR_EXCLUDE_REASON_LABELS.get(reason, reason)}({count}天)"
+        for reason, count in ranked[:3]
+    ]
+    return "、".join(parts)
+
+
+def _has_factor_data_completeness_issue(diagnostics: pd.DataFrame) -> bool:
+    if diagnostics.empty or "exclude_reason" not in diagnostics.columns:
+        return False
+
+    data_issue_reasons = {"missing_required_fields", "missing_daily_history"}
+    for raw in diagnostics["exclude_reason"].fillna("").astype(str):
+        parts = {part.strip() for part in raw.split(",") if part.strip()}
+        if parts & data_issue_reasons:
+            return True
+    return False
+
+
+def _data_quality_warning_note(context: str) -> str:
+    return (
+        f"{context}当前存在数据完整性风险，计算结果可能偏离真实可投资信号，"
+        "请勿直接据此做投资判断。"
     )
 
 
@@ -469,6 +790,20 @@ def _local_factor_history_start(
 ) -> pd.Timestamp | None:
     if not hasattr(loader, "cache_store") or not hasattr(loader, "source_name"):
         return None
+    cross_section_dir = (
+        loader.cache_store.base_dir
+        / loader.source_name
+        / "time_series"
+        / "cb_daily_cross_section"
+    )
+    if cross_section_dir.exists():
+        trade_days = [
+            pd.Timestamp(path.stem).normalize()
+            for path in cross_section_dir.glob("*.csv")
+            if path.stem.isdigit() and len(path.stem) == 8
+        ]
+        if trade_days:
+            return min(trade_days)
     if not codes:
         return None
     frames = [

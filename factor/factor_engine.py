@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 import numpy as np
 import pandas as pd
 
+from data.derived_metrics import estimate_ytm_series
 from strategy_config import FactorParameters, load_strategy_parameters
 
 
@@ -44,6 +45,7 @@ class FactorEngine:
     ) -> None:
         base = params or load_strategy_parameters(config_path).factor
         self.params = FactorParameters(
+            export_default_refresh=base.export_default_refresh,
             premium_center=base.premium_center if premium_center is None else float(premium_center),
             premium_width=base.premium_width if premium_width is None else float(premium_width),
             structure_gaussian_decay=base.structure_gaussian_decay,
@@ -73,6 +75,7 @@ class FactorEngine:
         cb_daily: pd.DataFrame,
         cb_basic: pd.DataFrame,
         cb_call: pd.DataFrame | None = None,
+        cb_rate: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Compute the five factor scores for the given date."""
 
@@ -81,6 +84,7 @@ class FactorEngine:
             cb_daily=cb_daily,
             cb_basic=cb_basic,
             cb_call=cb_call,
+            cb_rate=cb_rate,
         )
         if diagnostics.empty:
             return self._empty_result()
@@ -105,6 +109,7 @@ class FactorEngine:
         cb_daily: pd.DataFrame,
         cb_basic: pd.DataFrame,
         cb_call: pd.DataFrame | None = None,
+        cb_rate: pd.DataFrame | None = None,
         requested_codes: Iterable[str] | None = None,
     ) -> pd.DataFrame:
         """Compute scores plus eligibility diagnostics for the given date."""
@@ -112,62 +117,112 @@ class FactorEngine:
         as_of_ts = pd.Timestamp(as_of_date).normalize()
         codes = list(dict.fromkeys(requested_codes or []))
         history = cb_daily.loc[cb_daily["trade_date"].le(as_of_ts)].copy()
-        if codes:
-            history = history.loc[history["cb_code"].isin(codes)].copy()
         if history.empty:
             return self._empty_result(include_diagnostics=True, requested_codes=codes, as_of_ts=as_of_ts)
 
         history = history.sort_values(["cb_code", "trade_date"], kind="stable")
-        snapshot = self._build_snapshot(history, cb_basic, cb_call, as_of_ts)
-        if codes:
-            snapshot = self._append_missing_requested_codes(snapshot, codes, as_of_ts)
-
-        scored = snapshot.copy()
-        scored["double_low"] = scored["close"] + scored["premium_rate"]
-        scored["value_raw"] = -scored["double_low"]
-        scored["carry_raw"] = scored["ytm"]
-        scored["structure_raw"] = np.exp(
-            -self.params.structure_gaussian_decay
-            * ((scored["premium_rate"] - self.params.premium_center) / self.params.premium_width) ** 2
+        snapshot = self._build_snapshot(
+            history=history,
+            cb_basic=cb_basic,
+            cb_call=cb_call,
+            as_of_ts=as_of_ts,
+            cb_rate=cb_rate,
         )
-        scored["trend_raw"] = scored["momentum_60"]
-        scored["stability_raw"] = scored["volatility_60"]
+        diagnostics = self._score_snapshot(snapshot)
+        if codes:
+            diagnostics = diagnostics.loc[diagnostics["cb_code"].isin(codes)].copy()
+            diagnostics = self._append_missing_requested_diagnostics(
+                diagnostics,
+                requested_codes=codes,
+                as_of_ts=as_of_ts,
+            )
+        return diagnostics.sort_values(["trade_date", "cb_code"], kind="stable").reset_index(drop=True)
 
-        scored["value_score"] = self._zscore(self._winsorize(scored["value_raw"]))
-        scored["carry_score"] = self._zscore(self._winsorize(scored["carry_raw"]))
-        scored["structure_score"] = self._percentile_rank(scored["structure_raw"])
-        scored["trend_score"] = self._percentile_rank(scored["trend_raw"])
-        scored["stability_score"] = 1.0 - self._percentile_rank(scored["stability_raw"])
+    def compute_panel_with_diagnostics(
+        self,
+        trade_days: Iterable[object],
+        cb_daily: pd.DataFrame,
+        cb_basic: pd.DataFrame,
+        cb_call: pd.DataFrame | None = None,
+        cb_rate: pd.DataFrame | None = None,
+        requested_codes: Iterable[str] | None = None,
+    ) -> pd.DataFrame:
+        """Compute diagnostics for multiple trade days in one panel pass."""
 
-        scored["has_required_fields"] = scored[
-            ["premium_rate", "ytm", "momentum_60", "volatility_60"]
-        ].notna().all(axis=1)
-        scored["eligible"] = self._eligible_mask(scored)
-        scored["exclude_reason"] = scored.apply(self._build_exclude_reason, axis=1)
+        normalized_days = (
+            pd.DatetimeIndex(pd.to_datetime(list(trade_days), errors="coerce"))
+            .dropna()
+            .normalize()
+            .unique()
+            .sort_values()
+        )
+        codes = list(dict.fromkeys(requested_codes or []))
+        if len(normalized_days) == 0:
+            return pd.concat(
+                [
+                    self._empty_result(
+                        include_diagnostics=True,
+                        requested_codes=codes,
+                        as_of_ts=pd.Timestamp(day),
+                    )
+                    for day in normalized_days
+                ],
+                ignore_index=True,
+            ) if codes else self._empty_result(include_diagnostics=True)
 
-        ordered = scored.loc[
-            :,
-            [
-                "cb_code",
-                "trade_date",
-                "close",
-                "premium_rate",
-                "ytm",
-                "remain_size",
-                "amount_mean_20",
-                *self.SCORE_COLUMNS,
-                "eligible",
-                "exclude_reason",
-                "has_required_fields",
-                "is_recently_listed",
-                "is_size_ok",
-                "is_amount_ok",
-                "is_call_announced",
-                "is_put_triggered",
-                "is_tradable_now",
-            ],
+        history = cb_daily.loc[
+            cb_daily["trade_date"].le(pd.Timestamp(normalized_days.max()))
         ].copy()
-        return ordered.sort_values(["trade_date", "cb_code"], kind="stable").reset_index(drop=True)
+        if history.empty:
+            if not codes:
+                return self._empty_result(include_diagnostics=True)
+            return pd.concat(
+                [
+                    self._empty_result(
+                        include_diagnostics=True,
+                        requested_codes=codes,
+                        as_of_ts=pd.Timestamp(day),
+                    )
+                    for day in normalized_days
+                ],
+                ignore_index=True,
+            )
+
+        history = history.sort_values(["cb_code", "trade_date"], kind="stable")
+        prepared = self._prepare_history_metrics(history)
+        snapshot = prepared.loc[
+            prepared["trade_date"].isin(normalized_days)
+        ].copy()
+        if snapshot.empty:
+            if not codes:
+                return self._empty_result(include_diagnostics=True)
+            return pd.concat(
+                [
+                    self._empty_result(
+                        include_diagnostics=True,
+                        requested_codes=codes,
+                        as_of_ts=pd.Timestamp(day),
+                    )
+                    for day in normalized_days
+                ],
+                ignore_index=True,
+            )
+
+        snapshot = self._enrich_snapshot_rows(
+            snapshot=snapshot,
+            cb_basic=cb_basic,
+            cb_call=cb_call,
+            cb_rate=cb_rate,
+        )
+        diagnostics = self._score_snapshot(snapshot, group_column="trade_date")
+        if codes:
+            diagnostics = diagnostics.loc[diagnostics["cb_code"].isin(codes)].copy()
+            diagnostics = self._append_missing_requested_panel_diagnostics(
+                diagnostics,
+                requested_codes=codes,
+                trade_days=list(normalized_days),
+            )
+        return diagnostics.sort_values(["trade_date", "cb_code"], kind="stable").reset_index(drop=True)
 
     def append_weighted_total_score(
         self,
@@ -193,7 +248,23 @@ class FactorEngine:
         cb_basic: pd.DataFrame,
         cb_call: pd.DataFrame | None,
         as_of_ts: pd.Timestamp,
+        cb_rate: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        working = self._prepare_history_metrics(history)
+        latest = (
+            working.groupby("cb_code", group_keys=False)
+            .tail(1)
+            .copy()
+        )
+        latest["trade_date"] = as_of_ts
+        return self._enrich_snapshot_rows(
+            snapshot=latest,
+            cb_basic=cb_basic,
+            cb_call=cb_call,
+            cb_rate=cb_rate,
+        )
+
+    def _prepare_history_metrics(self, history: pd.DataFrame) -> pd.DataFrame:
         working = history.copy()
         grouped = working.groupby("cb_code", group_keys=False)
         working["daily_return"] = grouped["close"].pct_change()
@@ -214,10 +285,16 @@ class FactorEngine:
             ).mean()
         )
         working["listing_obs"] = grouped.cumcount() + 1
+        return working
 
-        latest = grouped.tail(1).copy()
-        latest["trade_date"] = as_of_ts
-
+    def _enrich_snapshot_rows(
+        self,
+        snapshot: pd.DataFrame,
+        cb_basic: pd.DataFrame,
+        cb_call: pd.DataFrame | None,
+        cb_rate: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        latest = snapshot.copy()
         basic_latest = cb_basic.drop_duplicates(subset=["cb_code"], keep="last").copy()
         latest = latest.merge(
             basic_latest[
@@ -233,18 +310,46 @@ class FactorEngine:
             how="left",
         )
 
+        if "premium_rate" in latest.columns and "convert_value" in latest.columns:
+            missing_premium = latest["premium_rate"].isna() & latest["convert_value"].gt(0)
+            latest.loc[missing_premium, "premium_rate"] = (
+                latest.loc[missing_premium, "close"]
+                / latest.loc[missing_premium, "convert_value"]
+                - 1.0
+            ) * 100.0
+
+        if "ytm" not in latest.columns:
+            latest["ytm"] = pd.NA
+        missing_ytm = latest["ytm"].isna()
+        if missing_ytm.any():
+            estimated = estimate_ytm_series(
+                cb_daily=latest.loc[missing_ytm, ["cb_code", "trade_date", "close"]].copy(),
+                cb_basic=cb_basic,
+                cb_rate=cb_rate if cb_rate is not None else pd.DataFrame(),
+            )
+            latest.loc[missing_ytm, "ytm"] = estimated.to_numpy()
+
         latest["is_call_announced"] = False
         if cb_call is not None and not cb_call.empty:
             call_type = cb_call["call_type"].fillna("").astype(str)
             call_status = cb_call["call_status"].fillna("").astype(str)
             call_mask = (
-                cb_call["announcement_date"].le(as_of_ts)
-                & self._contains_any(call_type, ("强赎", "寮鸿祹"))
+                self._contains_any(call_type, ("强赎", "寮鸿祹"))
                 & self._contains_any(call_status, ("强赎", "寮鸿祹"))
                 & ~self._contains_any(call_status, ("不强赎", "涓嶅己璧", "公告不强赎"))
             )
-            called_codes = cb_call.loc[call_mask, "cb_code"].dropna().unique().tolist()
-            latest["is_call_announced"] = latest["cb_code"].isin(called_codes)
+            called_from = (
+                cb_call.loc[call_mask, ["cb_code", "announcement_date"]]
+                .dropna(subset=["cb_code", "announcement_date"])
+                .sort_values(["cb_code", "announcement_date"], kind="stable")
+                .groupby("cb_code", as_index=False)["announcement_date"]
+                .min()
+                .rename(columns={"announcement_date": "call_announced_from"})
+            )
+            latest = latest.merge(called_from, on="cb_code", how="left")
+            latest["is_call_announced"] = latest["trade_date"].ge(
+                latest["call_announced_from"]
+            ).fillna(False)
 
         latest["is_put_triggered"] = False
         latest["is_recently_listed"] = latest["listing_obs"] < self.params.min_listing_days
@@ -254,6 +359,85 @@ class FactorEngine:
         )
         latest["is_tradable_now"] = latest["is_tradable"].fillna(False).astype(bool)
         return latest
+
+    def _score_snapshot(
+        self,
+        snapshot: pd.DataFrame,
+        group_column: str | None = None,
+    ) -> pd.DataFrame:
+        scored = snapshot.copy()
+        scored["double_low"] = scored["close"] + scored["premium_rate"]
+        scored["value_raw"] = -scored["double_low"]
+        scored["carry_raw"] = scored["ytm"]
+        scored["structure_raw"] = np.exp(
+            -self.params.structure_gaussian_decay
+            * ((scored["premium_rate"] - self.params.premium_center) / self.params.premium_width) ** 2
+        )
+        scored["trend_raw"] = scored["momentum_60"]
+        scored["stability_raw"] = scored["volatility_60"]
+        scored["has_required_fields"] = scored[
+            ["premium_rate", "ytm", "momentum_60", "volatility_60"]
+        ].notna().all(axis=1)
+        scored["eligible"] = self._eligible_mask(scored)
+
+        for column in self.SCORE_COLUMNS:
+            scored[column] = np.nan
+
+        if group_column is None:
+            self._assign_cross_section_scores(scored, scored.index[scored["eligible"]].tolist())
+        else:
+            for _, index in scored.groupby(group_column, sort=True).groups.items():
+                group_index = list(index)
+                eligible_index = scored.loc[group_index].index[scored.loc[group_index, "eligible"]].tolist()
+                self._assign_cross_section_scores(scored, eligible_index)
+
+        scored["exclude_reason"] = scored.apply(self._build_exclude_reason, axis=1)
+        return scored.loc[
+            :,
+            [
+                "cb_code",
+                "trade_date",
+                "close",
+                "premium_rate",
+                "ytm",
+                "remain_size",
+                "amount_mean_20",
+                *self.SCORE_COLUMNS,
+                "eligible",
+                "exclude_reason",
+                "has_required_fields",
+                "is_recently_listed",
+                "is_size_ok",
+                "is_amount_ok",
+                "is_call_announced",
+                "is_put_triggered",
+                "is_tradable_now",
+            ],
+        ].copy()
+
+    def _assign_cross_section_scores(
+        self,
+        scored: pd.DataFrame,
+        eligible_index: list[int],
+    ) -> None:
+        if not eligible_index:
+            return
+        eligible = scored.loc[eligible_index]
+        scored.loc[eligible_index, "value_score"] = self._zscore(
+            self._winsorize(eligible["value_raw"])
+        ).to_numpy()
+        scored.loc[eligible_index, "carry_score"] = self._zscore(
+            self._winsorize(eligible["carry_raw"])
+        ).to_numpy()
+        scored.loc[eligible_index, "structure_score"] = self._percentile_rank(
+            eligible["structure_raw"]
+        ).to_numpy()
+        scored.loc[eligible_index, "trend_score"] = self._percentile_rank(
+            eligible["trend_raw"]
+        ).to_numpy()
+        scored.loc[eligible_index, "stability_score"] = (
+            1.0 - self._percentile_rank(eligible["stability_raw"])
+        ).to_numpy()
 
     def _eligible_mask(self, snapshot: pd.DataFrame) -> pd.Series:
         return (
@@ -284,37 +468,55 @@ class FactorEngine:
             reasons.append("not_tradable")
         return "" if not reasons else ",".join(reasons)
 
-    def _append_missing_requested_codes(
+    def _append_missing_requested_diagnostics(
         self,
-        snapshot: pd.DataFrame,
+        frame: pd.DataFrame,
         requested_codes: list[str],
         as_of_ts: pd.Timestamp,
     ) -> pd.DataFrame:
-        existing = set(snapshot["cb_code"].dropna().tolist())
+        existing = set(frame["cb_code"].dropna().tolist())
         missing = [code for code in requested_codes if code not in existing]
         if not missing:
-            return snapshot
-
-        placeholders = pd.DataFrame(
-            {
-                "cb_code": missing,
-                "trade_date": [as_of_ts] * len(missing),
-                "close": [pd.NA] * len(missing),
-                "premium_rate": [pd.NA] * len(missing),
-                "ytm": [pd.NA] * len(missing),
-                "remain_size": [pd.NA] * len(missing),
-                "amount_mean_20": [pd.NA] * len(missing),
-                "momentum_60": [pd.NA] * len(missing),
-                "volatility_60": [pd.NA] * len(missing),
-                "is_recently_listed": [False] * len(missing),
-                "is_size_ok": [False] * len(missing),
-                "is_amount_ok": [False] * len(missing),
-                "is_call_announced": [False] * len(missing),
-                "is_put_triggered": [False] * len(missing),
-                "is_tradable_now": [False] * len(missing),
-            }
+            return frame
+        placeholders = self._empty_result(
+            include_diagnostics=True,
+            requested_codes=missing,
+            as_of_ts=as_of_ts,
         )
-        return pd.concat([snapshot, placeholders], ignore_index=True, sort=False)
+        return pd.concat([frame, placeholders], ignore_index=True, sort=False)
+
+    def _append_missing_requested_panel_diagnostics(
+        self,
+        frame: pd.DataFrame,
+        requested_codes: list[str],
+        trade_days: list[pd.Timestamp],
+    ) -> pd.DataFrame:
+        if not requested_codes or not trade_days:
+            return frame
+        existing = frame.loc[:, ["trade_date", "cb_code"]].drop_duplicates().copy()
+        expected = pd.MultiIndex.from_product(
+            [pd.DatetimeIndex(trade_days), requested_codes],
+            names=["trade_date", "cb_code"],
+        ).to_frame(index=False)
+        missing = expected.merge(
+            existing,
+            on=["trade_date", "cb_code"],
+            how="left",
+            indicator=True,
+        )
+        missing = missing.loc[missing["_merge"] == "left_only", ["trade_date", "cb_code"]]
+        if missing.empty:
+            return frame
+
+        placeholders = [
+            self._empty_result(
+                include_diagnostics=True,
+                requested_codes=group["cb_code"].tolist(),
+                as_of_ts=pd.Timestamp(trade_date),
+            )
+            for trade_date, group in missing.groupby("trade_date", sort=True)
+        ]
+        return pd.concat([frame, *placeholders], ignore_index=True, sort=False)
 
     def _winsorize(self, series: pd.Series) -> pd.Series:
         valid = series.dropna()

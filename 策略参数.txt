@@ -5,6 +5,8 @@
 # 3. 单次回测里随时间推进而偏移的参数，应在回测任务中临时覆盖，不回写本文件。
 
 [env]
+# 环境打分入口默认是否强制刷新远端数据；false 表示缓存优先并自动补数，true 表示每次默认强制刷新
+export_default_refresh = false
 # 环境分位数计算窗口长度
 percentile_window = 252
 # 环境分位数最小有效样本数
@@ -121,6 +123,8 @@ max_forward_fill_days = 3
 required = true
 
 [factor]
+# 因子打分入口默认是否强制刷新远端数据；false 表示缓存优先并自动补数，true 表示每次默认强制刷新
+export_default_refresh = false
 # 结构因子的理想转股溢价率中心
 premium_center = 20.0
 # 结构因子的理想转股溢价率宽度

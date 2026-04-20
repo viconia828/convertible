@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 
 from scoring_exports import (
+    _build_factor_code_sheet_name_map,
+    _recommended_factor_history_buffer_calendar_days,
     build_environment_score_report,
     build_factor_score_report,
     normalize_cb_codes,
@@ -86,6 +88,34 @@ class StubLoader:
         return frame.loc[
             frame["cb_code"].isin(codes) & frame["trade_date"].between(start_ts, end_ts)
         ].reset_index(drop=True)
+
+    def get_cb_daily_cross_section(
+        self,
+        start_date: object,
+        end_date: object,
+        refresh: bool = False,
+    ) -> pd.DataFrame:
+        start_ts = pd.Timestamp(start_date).normalize()
+        end_ts = pd.Timestamp(end_date).normalize()
+        frame = self._cb_daily.copy()
+        return frame.loc[
+            frame["trade_date"].between(start_ts, end_ts)
+        ].reset_index(drop=True)
+
+    def get_cb_rate(
+        self,
+        codes: list[str],
+        refresh: bool = False,
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "cb_code",
+                "rate_frequency",
+                "rate_start_date",
+                "rate_end_date",
+                "coupon_rate",
+            ]
+        )
 
     def get_cb_basic(self) -> pd.DataFrame:
         return self._cb_basic.copy()
@@ -209,6 +239,10 @@ class ScoringExportsTests(unittest.TestCase):
         result = normalize_cb_codes("110073.SH, 128044.SZ；110073.SH 113001.SH")
         self.assertEqual(result, ["110073.SH", "128044.SZ", "113001.SH"])
 
+    def test_normalize_cb_codes_auto_appends_exchange_suffix_for_six_digit_input(self) -> None:
+        result = normalize_cb_codes("110073, 128044；113001 110073")
+        self.assertEqual(result, ["110073.SH", "128044.SZ", "113001.SH"])
+
     def test_build_environment_report_and_write_xlsx(self) -> None:
         trading_calendar, macro_daily = self._make_env_inputs()
         cb_daily, cb_basic, cb_call, _ = self._make_factor_inputs()
@@ -236,6 +270,55 @@ class ScoringExportsTests(unittest.TestCase):
             sheets,
             [config.exports.env_sheet_name, config.exports.summary_sheet_name],
         )
+        summary = pd.read_excel(written, sheet_name=config.exports.summary_sheet_name)
+        self.assertEqual(list(summary.columns), ["item", "value", "comment"])
+        report_type_row = summary.loc[summary["item"] == "report_type"].iloc[0]
+        self.assertIn("环境打分导出结果", str(report_type_row["comment"]))
+        fetch_policy_row = summary.loc[summary["item"] == "fetch_policy"].iloc[0]
+        self.assertIn("缓存优先", str(fetch_policy_row["value"]))
+        filled_row = summary.loc[summary["item"] == "filled_days::credit_spread"].iloc[0]
+        self.assertIn("信用利差", str(filled_row["comment"]))
+
+    def test_environment_report_notes_when_requested_window_is_partially_covered(self) -> None:
+        trading_calendar, macro_daily = self._make_env_inputs()
+        cb_daily, cb_basic, cb_call, _ = self._make_factor_inputs()
+        cutoff = pd.Timestamp("2025-03-10")
+        macro_daily = macro_daily.loc[
+            ~(
+                (macro_daily["indicator_code"] == "cb_equal_weight")
+                & (macro_daily["trade_date"] < cutoff)
+            )
+        ].reset_index(drop=True)
+        loader = StubLoader(trading_calendar, macro_daily, cb_daily, cb_basic, cb_call)
+        config = load_strategy_parameters()
+
+        report = build_environment_score_report(
+            "2025-03-01",
+            "2025-03-31",
+            loader=loader,
+            config=config,
+        )
+
+        self.assertGreater(report.scores["trade_date"].min(), pd.Timestamp("2025-03-01"))
+        self.assertTrue(any("首个可导出交易日" in note for note in report.notes))
+        self.assertTrue(any("2025-03-10" in note for note in report.notes))
+        self.assertTrue(any("请勿直接据此做投资判断" in note for note in report.notes))
+
+    def test_environment_report_does_not_flag_non_trading_requested_start_as_gap(self) -> None:
+        trading_calendar, macro_daily = self._make_env_inputs()
+        cb_daily, cb_basic, cb_call, _ = self._make_factor_inputs()
+        loader = StubLoader(trading_calendar, macro_daily, cb_daily, cb_basic, cb_call)
+        config = load_strategy_parameters()
+
+        report = build_environment_score_report(
+            "2025-03-01",
+            "2025-03-31",
+            loader=loader,
+            config=config,
+        )
+
+        self.assertEqual(report.scores["trade_date"].min(), pd.Timestamp("2025-03-03"))
+        self.assertFalse(any("首个可导出交易日" in note for note in report.notes))
 
     def test_build_factor_report_and_write_xlsx(self) -> None:
         env_calendar, macro_daily = self._make_env_inputs()
@@ -265,11 +348,31 @@ class ScoringExportsTests(unittest.TestCase):
         self.assertEqual(
             sheets,
             [
-                config.exports.factor_sheet_name,
+                "CB_A",
+                "CB_B",
                 config.exports.diagnostics_sheet_name,
                 config.exports.summary_sheet_name,
             ],
         )
+        cb_a_scores = pd.read_excel(written, sheet_name="CB_A")
+        self.assertEqual(set(cb_a_scores["cb_code"]), {"CB_A"})
+        summary = pd.read_excel(written, sheet_name=config.exports.summary_sheet_name)
+        self.assertEqual(list(summary.columns), ["item", "value", "comment"])
+        report_type_row = summary.loc[summary["item"] == "report_type"].iloc[0]
+        self.assertIn("因子打分导出结果", str(report_type_row["comment"]))
+        status_row = summary.loc[summary["item"] == "data_quality_status"].iloc[0]
+        self.assertIn(str(status_row["value"]), {"正常", "警告"})
+
+    def test_factor_sheet_name_map_avoids_reserved_names_and_duplicates(self) -> None:
+        mapping = _build_factor_code_sheet_name_map(
+            codes=["run_summary", "filter_diagnostics", "AA/BB", "AA:BB"],
+            reserved_names=("run_summary", "filter_diagnostics"),
+        )
+
+        self.assertNotEqual(mapping["run_summary"], "run_summary")
+        self.assertNotEqual(mapping["filter_diagnostics"], "filter_diagnostics")
+        self.assertEqual(mapping["AA/BB"], "AA_BB")
+        self.assertNotEqual(mapping["AA/BB"], mapping["AA:BB"])
 
     def test_factor_report_enforces_single_run_code_limit(self) -> None:
         trading_calendar, macro_daily = self._make_env_inputs()
@@ -287,6 +390,90 @@ class ScoringExportsTests(unittest.TestCase):
                 loader=loader,
                 config=config,
             )
+
+    def test_factor_history_buffer_uses_dynamic_recommended_window(self) -> None:
+        config = load_strategy_parameters()
+        recommended_days = _recommended_factor_history_buffer_calendar_days(config)
+
+        self.assertLess(recommended_days, config.exports.factor_history_buffer_calendar_days)
+        self.assertGreaterEqual(recommended_days, 60)
+
+    def test_factor_report_notes_when_no_eligible_scores_exist(self) -> None:
+        trading_calendar, macro_daily = self._make_env_inputs()
+        cb_daily, cb_basic, cb_call, factor_calendar = self._make_factor_inputs()
+        loader = StubLoader(factor_calendar, macro_daily, cb_daily, cb_basic, cb_call)
+        config = load_strategy_parameters()
+
+        report = build_factor_score_report(
+            "2026-01-05",
+            "2026-01-12",
+            codes=["CB_A"],
+            loader=loader,
+            config=config,
+        )
+
+        self.assertTrue(any("未产生可用因子分数" in note for note in report.notes))
+        self.assertTrue(any("核心因子字段不足" in note for note in report.notes))
+        self.assertTrue(any("上市观察期不足" in note for note in report.notes))
+        self.assertTrue(any("请勿直接据此做投资判断" in note for note in report.notes))
+
+    def test_single_code_factor_report_uses_full_cross_section_scoring(self) -> None:
+        trading_calendar, macro_daily = self._make_env_inputs()
+        cb_daily, cb_basic, cb_call, factor_calendar = self._make_factor_inputs()
+        loader = StubLoader(factor_calendar, macro_daily, cb_daily, cb_basic, cb_call)
+        config = load_strategy_parameters()
+
+        full_report = build_factor_score_report(
+            "2026-04-13",
+            "2026-04-22",
+            codes=["CB_A", "CB_B"],
+            loader=loader,
+            config=config,
+        )
+        single_report = build_factor_score_report(
+            "2026-04-13",
+            "2026-04-22",
+            codes=["CB_A"],
+            loader=loader,
+            config=config,
+        )
+
+        full_cb_a = (
+            full_report.scores.loc[full_report.scores["cb_code"] == "CB_A"]
+            .sort_values("trade_date", kind="stable")
+            .reset_index(drop=True)
+        )
+        single_cb_a = single_report.scores.sort_values("trade_date", kind="stable").reset_index(drop=True)
+
+        self.assertEqual(len(full_cb_a), len(single_cb_a))
+        pd.testing.assert_frame_equal(
+            full_cb_a.loc[
+                :,
+                [
+                    "trade_date",
+                    "cb_code",
+                    "baseline_total_score",
+                    "value_score",
+                    "carry_score",
+                    "structure_score",
+                    "trend_score",
+                    "stability_score",
+                ],
+            ].reset_index(drop=True),
+            single_cb_a.loc[
+                :,
+                [
+                    "trade_date",
+                    "cb_code",
+                    "baseline_total_score",
+                    "value_score",
+                    "carry_score",
+                    "structure_score",
+                    "trend_score",
+                    "stability_score",
+                ],
+            ].reset_index(drop=True),
+        )
 
 
 if __name__ == "__main__":

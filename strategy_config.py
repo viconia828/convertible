@@ -30,6 +30,7 @@ DEFAULT_CONFIG_PAYLOAD: dict[str, Any] = {
         "credit_spread_timeout": 30,
     },
     "env": {
+        "export_default_refresh": False,
         "percentile_window": 252,
         "percentile_min_periods": 20,
         "equity_ema_span": 20,
@@ -82,6 +83,7 @@ DEFAULT_CONFIG_PAYLOAD: dict[str, Any] = {
         },
     },
     "factor": {
+        "export_default_refresh": False,
         "premium_center": 20.0,
         "premium_width": 15.0,
         "structure_gaussian_decay": 0.5,
@@ -219,6 +221,7 @@ class EnvironmentTrendParameters:
 
 @dataclass(frozen=True)
 class EnvironmentParameters:
+    export_default_refresh: bool
     percentile_window: int
     percentile_min_periods: int
     equity_ema_span: int
@@ -234,6 +237,7 @@ class EnvironmentParameters:
 
 @dataclass(frozen=True)
 class FactorParameters:
+    export_default_refresh: bool
     premium_center: float
     premium_width: float
     structure_gaussian_decay: float
@@ -341,6 +345,7 @@ class StrategyParameters:
                 credit_spread_timeout=int(data["credit_spread_timeout"]),
             ),
             env=EnvironmentParameters(
+                export_default_refresh=bool(env.get("export_default_refresh", False)),
                 percentile_window=int(env["percentile_window"]),
                 percentile_min_periods=int(env["percentile_min_periods"]),
                 equity_ema_span=int(env["equity_ema_span"]),
@@ -386,6 +391,7 @@ class StrategyParameters:
                 alignment=MacroAlignmentParameters(rules=alignment_rules),
             ),
             factor=FactorParameters(
+                export_default_refresh=bool(factor.get("export_default_refresh", False)),
                 premium_center=float(factor["premium_center"]),
                 premium_width=float(factor["premium_width"]),
                 structure_gaussian_decay=float(factor["structure_gaussian_decay"]),

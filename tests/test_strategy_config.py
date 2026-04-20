@@ -10,7 +10,9 @@ class StrategyConfigTests(unittest.TestCase):
         config = load_strategy_parameters()
 
         self.assertEqual(config.data.source_name, "tushare")
+        self.assertFalse(config.env.export_default_refresh)
         self.assertEqual(config.env.percentile_window, 252)
+        self.assertFalse(config.factor.export_default_refresh)
         self.assertEqual(config.factor.min_listing_days, 30)
         self.assertEqual(config.model.base_weights["value"], 0.25)
         self.assertEqual(config.exports.factor_max_codes_per_run, 20)
@@ -20,7 +22,11 @@ class StrategyConfigTests(unittest.TestCase):
         overridden = load_strategy_parameters(
             overrides={
                 "factor": {
+                    "export_default_refresh": True,
                     "min_listing_days": 45,
+                },
+                "env": {
+                    "export_default_refresh": True,
                 },
                 "exports": {
                     "factor_max_codes_per_run": 5,
@@ -28,7 +34,11 @@ class StrategyConfigTests(unittest.TestCase):
             }
         )
 
+        self.assertFalse(base.env.export_default_refresh)
+        self.assertTrue(overridden.env.export_default_refresh)
         self.assertEqual(base.factor.min_listing_days, 30)
+        self.assertFalse(base.factor.export_default_refresh)
+        self.assertTrue(overridden.factor.export_default_refresh)
         self.assertEqual(overridden.factor.min_listing_days, 45)
         self.assertEqual(base.exports.factor_max_codes_per_run, 20)
         self.assertEqual(overridden.exports.factor_max_codes_per_run, 5)

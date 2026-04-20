@@ -6,6 +6,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from .exceptions import DataSourceUnavailable, TushareAPIError
 
 class TushareClient:
     """Minimal Tushare Pro client that avoids non-stdlib HTTP dependencies."""
+
+    supports_parallel_requests = True
 
     def __init__(
         self,
@@ -42,6 +45,7 @@ class TushareClient:
         self.calendar_exchange = params.calendar_exchange
         self._temporarily_unavailable = False
         self._last_unavailable_error: str | None = None
+        self._opener = self._build_opener()
         if not self.token:
             raise DataSourceUnavailable(
                 "TUSHARE_TOKEN is not configured in the environment."
@@ -79,7 +83,7 @@ class TushareClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with self._opener.open(request, timeout=self.timeout) as response:
                     body = response.read().decode("utf-8")
                 last_error = None
                 break
@@ -131,3 +135,25 @@ class TushareClient:
         """Whether Tushare has already failed in the current process."""
 
         return self._temporarily_unavailable
+
+    def _build_opener(self) -> urllib.request.OpenerDirector:
+        if self._should_bypass_env_proxy():
+            return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return urllib.request.build_opener()
+
+    def _should_bypass_env_proxy(self) -> bool:
+        for key in ("http", "https"):
+            proxy_url = os.environ.get(f"{key.upper()}_PROXY") or os.environ.get(
+                f"{key.lower()}_proxy"
+            )
+            if not proxy_url:
+                continue
+            if self._is_loopback_blackhole_proxy(proxy_url):
+                return True
+        return False
+
+    def _is_loopback_blackhole_proxy(self, proxy_url: str) -> bool:
+        parsed = urllib.parse.urlparse(proxy_url)
+        host = (parsed.hostname or "").strip("[]").lower()
+        port = parsed.port
+        return host in {"127.0.0.1", "localhost", "::1"} and port == 9

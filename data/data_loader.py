@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,11 @@ from .utils import ensure_list, format_tushare_date, merge_frames, normalize_dat
 
 class DataLoader:
     """Primary Step 0 data interface using Tushare plus local caches."""
+
+    CB_DAILY_CROSS_SECTION_MAX_WORKERS = 4
+    CB_DAILY_CROSS_SECTION_PARALLEL_THRESHOLD = 8
+    CODE_SERIES_MAX_WORKERS = 4
+    CODE_SERIES_PARALLEL_THRESHOLD = 4
 
     def __init__(
         self,
@@ -134,8 +140,13 @@ class DataLoader:
 
         trade_days = self.calendar.get_open_days(start_date, end_date)
         schema = DataSchema.get_schema("cb_daily")
+        if not trade_days:
+            return DataSchema.empty_frame("cb_daily")
+
         frames: list[pd.DataFrame] = []
-        remote_available = not getattr(self.client, "is_temporarily_unavailable", False)
+        cached_frames_by_day: dict[str, pd.DataFrame] = {}
+        fallback_frames_by_day: dict[str, pd.DataFrame | None] = {}
+        missing_trade_days: list[str] = []
 
         for trade_day in trade_days:
             trade_day_str = pd.Timestamp(trade_day).strftime("%Y%m%d")
@@ -146,37 +157,33 @@ class DataLoader:
                 DataSchema.standardize("cb_daily", cached) if cached is not None else None
             )
             if refresh or cached is None or cached.empty:
-                if remote_available:
-                    try:
-                        fetched = self.client.query(
-                            api_name=schema.api_name or "cb_daily",
-                            params={"trade_date": trade_day_str},
-                            fields=schema.source_fields,
-                        )
-                        merged = DataSchema.standardize("cb_daily", fetched)
-                        self.cache_store.save_time_series(
-                            self.source_name,
-                            "cb_daily_cross_section",
-                            trade_day_str,
-                            merged,
-                        )
-                    except Exception:  # noqa: BLE001
-                        remote_available = False
-                        merged = (
-                            cached
-                            if cached is not None and not cached.empty
-                            else DataSchema.empty_frame("cb_daily")
-                        )
-                else:
-                    merged = (
-                        cached
-                        if cached is not None and not cached.empty
-                        else DataSchema.empty_frame("cb_daily")
-                    )
+                missing_trade_days.append(trade_day_str)
+                fallback_frames_by_day[trade_day_str] = cached
             else:
-                merged = cached
-            if merged is not None:
-                frames.append(merged)
+                cached_frames_by_day[trade_day_str] = cached
+
+        fetched_frames_by_day: dict[str, pd.DataFrame] = {}
+        if missing_trade_days and not getattr(
+            self.client, "is_temporarily_unavailable", False
+        ):
+            fetched_frames_by_day = self._fetch_cb_daily_cross_sections(
+                schema=schema,
+                trade_day_strs=missing_trade_days,
+            )
+
+        for trade_day in trade_days:
+            trade_day_str = pd.Timestamp(trade_day).strftime("%Y%m%d")
+            merged = cached_frames_by_day.get(trade_day_str)
+            if merged is None:
+                merged = fetched_frames_by_day.get(trade_day_str)
+            if merged is None:
+                fallback = fallback_frames_by_day.get(trade_day_str)
+                merged = (
+                    fallback
+                    if fallback is not None and not fallback.empty
+                    else DataSchema.empty_frame("cb_daily")
+                )
+            frames.append(merged)
 
         if not frames:
             return DataSchema.empty_frame("cb_daily")
@@ -191,26 +198,40 @@ class DataLoader:
 
         schema = DataSchema.get_schema("cb_rate")
         frames: list[pd.DataFrame] = []
+        codes_list = ensure_list(codes)
+        cached_by_code: dict[str, pd.DataFrame] = {}
+        fallback_by_code: dict[str, pd.DataFrame | None] = {}
+        missing_codes: list[str] = []
 
-        for code in ensure_list(codes):
+        for code in codes_list:
             cached = None if refresh else self.cache_store.load_time_series(
                 self.source_name, "cb_rate", code
             )
             cached = DataSchema.standardize("cb_rate", cached) if cached is not None else None
-
             if refresh or cached is None or cached.empty:
-                fetched = self.client.query(
-                    api_name=schema.api_name or "cb_rate",
-                    params={"ts_code": code},
-                    fields=schema.source_fields,
-                )
-                merged = DataSchema.standardize("cb_rate", fetched)
-                self.cache_store.save_time_series(
-                    self.source_name, "cb_rate", code, merged
-                )
+                missing_codes.append(code)
+                fallback_by_code[code] = cached
             else:
-                merged = cached
+                cached_by_code[code] = cached
 
+        fetched_by_code: dict[str, pd.DataFrame] = {}
+        if missing_codes and not getattr(self.client, "is_temporarily_unavailable", False):
+            fetched_by_code = self._fetch_cb_rate_codes(
+                schema=schema,
+                codes=missing_codes,
+            )
+
+        for code in codes_list:
+            merged = cached_by_code.get(code)
+            if merged is None:
+                merged = fetched_by_code.get(code)
+            if merged is None:
+                fallback = fallback_by_code.get(code)
+                merged = (
+                    fallback
+                    if fallback is not None and not fallback.empty
+                    else DataSchema.empty_frame("cb_rate")
+                )
             frames.append(merged)
 
         if not frames:
@@ -493,52 +514,44 @@ class DataLoader:
         end_ts = normalize_date(end_date)
         frames: list[pd.DataFrame] = []
         code_field = schema.key_columns[0]
+        codes_list = ensure_list(codes)
+        cached_by_code: dict[str, pd.DataFrame] = {}
+        fallback_by_code: dict[str, pd.DataFrame | None] = {}
+        missing_codes: list[str] = []
 
-        for code in ensure_list(codes):
+        for code in codes_list:
             cached = None if refresh else self.cache_store.load_time_series(
                 self.source_name, dataset_name, code
             )
             cached = DataSchema.standardize(dataset_name, cached) if cached is not None else None
-
             if refresh or not self._covers_time_series(cached, start_ts, end_ts, "trade_date"):
-                if getattr(self.client, "is_temporarily_unavailable", False):
-                    merged = (
-                        cached
-                        if cached is not None and not cached.empty
-                        else DataSchema.empty_frame(dataset_name)
-                    )
-                else:
-                    try:
-                        fetched = self.client.query(
-                            api_name=schema.api_name or dataset_name,
-                            params={
-                                "ts_code": code,
-                                "start_date": format_tushare_date(start_ts),
-                                "end_date": format_tushare_date(end_ts),
-                            },
-                            fields=schema.source_fields,
-                        )
-                        fetched = DataSchema.standardize(dataset_name, fetched)
-                        merged = DataSchema.standardize(
-                            dataset_name,
-                            merge_frames(
-                                cached,
-                                fetched,
-                                key_columns=schema.key_columns,
-                                sort_columns=schema.sort_columns,
-                            ),
-                        )
-                        self.cache_store.save_time_series(
-                            self.source_name, dataset_name, code, merged
-                        )
-                    except Exception:  # noqa: BLE001
-                        merged = (
-                            cached
-                            if cached is not None and not cached.empty
-                            else DataSchema.empty_frame(dataset_name)
-                        )
+                missing_codes.append(code)
+                fallback_by_code[code] = cached
             else:
-                merged = cached
+                cached_by_code[code] = cached
+
+        fetched_by_code: dict[str, pd.DataFrame] = {}
+        if missing_codes and not getattr(self.client, "is_temporarily_unavailable", False):
+            fetched_by_code = self._fetch_time_series_codes(
+                dataset_name=dataset_name,
+                schema=schema,
+                codes=missing_codes,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                cached_by_code=fallback_by_code,
+            )
+
+        for code in codes_list:
+            merged = cached_by_code.get(code)
+            if merged is None:
+                merged = fetched_by_code.get(code)
+            if merged is None:
+                fallback = fallback_by_code.get(code)
+                merged = (
+                    fallback
+                    if fallback is not None and not fallback.empty
+                    else DataSchema.empty_frame(dataset_name)
+                )
 
             if merged is None or merged.empty:
                 frames.append(DataSchema.empty_frame(dataset_name))
@@ -555,6 +568,268 @@ class DataLoader:
             return DataSchema.empty_frame(dataset_name)
         return DataSchema.standardize(dataset_name, pd.concat(frames, ignore_index=True))
 
+    def _fetch_time_series_codes(
+        self,
+        dataset_name: str,
+        schema,
+        codes: list[str],
+        start_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+        cached_by_code: dict[str, pd.DataFrame | None],
+    ) -> dict[str, pd.DataFrame]:
+        if not codes:
+            return {}
+        if self._should_parallel_fetch_code_series(len(codes)):
+            return self._fetch_time_series_codes_parallel(
+                dataset_name=dataset_name,
+                schema=schema,
+                codes=codes,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                cached_by_code=cached_by_code,
+            )
+        return self._fetch_time_series_codes_sequential(
+            dataset_name=dataset_name,
+            schema=schema,
+            codes=codes,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            cached_by_code=cached_by_code,
+        )
+
+    def _fetch_time_series_codes_sequential(
+        self,
+        dataset_name: str,
+        schema,
+        codes: list[str],
+        start_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+        cached_by_code: dict[str, pd.DataFrame | None],
+    ) -> dict[str, pd.DataFrame]:
+        fetched_by_code: dict[str, pd.DataFrame] = {}
+        for code in codes:
+            try:
+                fetched_by_code[code] = self._fetch_time_series_code(
+                    dataset_name=dataset_name,
+                    schema=schema,
+                    code=code,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    cached=cached_by_code.get(code),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        return fetched_by_code
+
+    def _fetch_time_series_codes_parallel(
+        self,
+        dataset_name: str,
+        schema,
+        codes: list[str],
+        start_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+        cached_by_code: dict[str, pd.DataFrame | None],
+    ) -> dict[str, pd.DataFrame]:
+        fetched_by_code: dict[str, pd.DataFrame] = {}
+        max_workers = min(self.CODE_SERIES_MAX_WORKERS, len(codes))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_by_code = {
+                executor.submit(
+                    self._fetch_time_series_code,
+                    dataset_name,
+                    schema,
+                    code,
+                    start_ts,
+                    end_ts,
+                    cached_by_code.get(code),
+                ): code
+                for code in codes
+            }
+            for future in as_completed(future_by_code):
+                code = future_by_code[future]
+                try:
+                    fetched_by_code[code] = future.result()
+                except Exception:  # noqa: BLE001
+                    continue
+        return fetched_by_code
+
+    def _fetch_time_series_code(
+        self,
+        dataset_name: str,
+        schema,
+        code: str,
+        start_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+        cached: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        fetched = self.client.query(
+            api_name=schema.api_name or dataset_name,
+            params={
+                "ts_code": code,
+                "start_date": format_tushare_date(start_ts),
+                "end_date": format_tushare_date(end_ts),
+            },
+            fields=schema.source_fields,
+        )
+        fetched = DataSchema.standardize(dataset_name, fetched)
+        merged = DataSchema.standardize(
+            dataset_name,
+            merge_frames(
+                cached,
+                fetched,
+                key_columns=schema.key_columns,
+                sort_columns=schema.sort_columns,
+            ),
+        )
+        self.cache_store.save_time_series(
+            self.source_name, dataset_name, code, merged
+        )
+        return merged
+
+    def _fetch_cb_rate_codes(
+        self,
+        schema,
+        codes: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        if not codes:
+            return {}
+        if self._should_parallel_fetch_code_series(len(codes)):
+            return self._fetch_cb_rate_codes_parallel(schema, codes)
+        return self._fetch_cb_rate_codes_sequential(schema, codes)
+
+    def _fetch_cb_rate_codes_sequential(
+        self,
+        schema,
+        codes: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        fetched_by_code: dict[str, pd.DataFrame] = {}
+        for code in codes:
+            try:
+                fetched_by_code[code] = self._fetch_cb_rate_code(schema, code)
+            except Exception:  # noqa: BLE001
+                continue
+        return fetched_by_code
+
+    def _fetch_cb_rate_codes_parallel(
+        self,
+        schema,
+        codes: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        fetched_by_code: dict[str, pd.DataFrame] = {}
+        max_workers = min(self.CODE_SERIES_MAX_WORKERS, len(codes))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_by_code = {
+                executor.submit(self._fetch_cb_rate_code, schema, code): code
+                for code in codes
+            }
+            for future in as_completed(future_by_code):
+                code = future_by_code[future]
+                try:
+                    fetched_by_code[code] = future.result()
+                except Exception:  # noqa: BLE001
+                    continue
+        return fetched_by_code
+
+    def _fetch_cb_rate_code(
+        self,
+        schema,
+        code: str,
+    ) -> pd.DataFrame:
+        fetched = self.client.query(
+            api_name=schema.api_name or "cb_rate",
+            params={"ts_code": code},
+            fields=schema.source_fields,
+        )
+        merged = DataSchema.standardize("cb_rate", fetched)
+        self.cache_store.save_time_series(
+            self.source_name, "cb_rate", code, merged
+        )
+        return merged
+
+    def _fetch_cb_daily_cross_sections(
+        self,
+        schema,
+        trade_day_strs: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        if not trade_day_strs:
+            return {}
+        if self._should_parallel_fetch_cb_daily_cross_sections(len(trade_day_strs)):
+            return self._fetch_cb_daily_cross_sections_parallel(schema, trade_day_strs)
+        return self._fetch_cb_daily_cross_sections_sequential(schema, trade_day_strs)
+
+    def _fetch_cb_daily_cross_sections_sequential(
+        self,
+        schema,
+        trade_day_strs: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        fetched_frames: dict[str, pd.DataFrame] = {}
+        for trade_day_str in trade_day_strs:
+            try:
+                fetched_frames[trade_day_str] = self._fetch_cb_daily_cross_section_for_day(
+                    schema,
+                    trade_day_str,
+                )
+            except Exception:  # noqa: BLE001
+                break
+        return fetched_frames
+
+    def _fetch_cb_daily_cross_sections_parallel(
+        self,
+        schema,
+        trade_day_strs: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        fetched_frames: dict[str, pd.DataFrame] = {}
+        max_workers = min(self.CB_DAILY_CROSS_SECTION_MAX_WORKERS, len(trade_day_strs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_by_day = {
+                executor.submit(
+                    self._fetch_cb_daily_cross_section_for_day,
+                    schema,
+                    trade_day_str,
+                ): trade_day_str
+                for trade_day_str in trade_day_strs
+            }
+            for future in as_completed(future_by_day):
+                trade_day_str = future_by_day[future]
+                try:
+                    fetched_frames[trade_day_str] = future.result()
+                except Exception:  # noqa: BLE001
+                    continue
+        return fetched_frames
+
+    def _fetch_cb_daily_cross_section_for_day(
+        self,
+        schema,
+        trade_day_str: str,
+    ) -> pd.DataFrame:
+        fetched = self.client.query(
+            api_name=schema.api_name or "cb_daily",
+            params={"trade_date": trade_day_str},
+            fields=schema.source_fields,
+        )
+        merged = DataSchema.standardize("cb_daily", fetched)
+        self.cache_store.save_time_series(
+            self.source_name,
+            "cb_daily_cross_section",
+            trade_day_str,
+            merged,
+        )
+        return merged
+
+    def _should_parallel_fetch_cb_daily_cross_sections(self, missing_days: int) -> bool:
+        return bool(
+            missing_days >= self.CB_DAILY_CROSS_SECTION_PARALLEL_THRESHOLD
+            and self.CB_DAILY_CROSS_SECTION_MAX_WORKERS > 1
+            and getattr(self.client, "supports_parallel_requests", False)
+        )
+
+    def _should_parallel_fetch_code_series(self, missing_codes: int) -> bool:
+        return bool(
+            missing_codes >= self.CODE_SERIES_PARALLEL_THRESHOLD
+            and self.CODE_SERIES_MAX_WORKERS > 1
+            and getattr(self.client, "supports_parallel_requests", False)
+        )
+
     def _covers_time_series(
         self,
         frame: pd.DataFrame | None,
@@ -568,6 +843,38 @@ class DataLoader:
         if values.empty:
             return False
         return bool(values.min() <= start_ts and values.max() >= end_ts)
+
+    def _covers_expected_dates(
+        self,
+        frame: pd.DataFrame | None,
+        expected_dates: list[object],
+        date_column: str,
+        indicator_code: str | None = None,
+    ) -> bool:
+        if not expected_dates:
+            return True
+        if frame is None or frame.empty or date_column not in frame.columns:
+            return False
+
+        working = frame
+        if indicator_code is not None and "indicator_code" in working.columns:
+            working = working.loc[working["indicator_code"] == indicator_code]
+        if working.empty:
+            return False
+
+        actual_dates = (
+            pd.to_datetime(working[date_column], errors="coerce")
+            .dropna()
+            .dt.normalize()
+            .unique()
+        )
+        if len(actual_dates) == 0:
+            return False
+
+        expected_index = pd.DatetimeIndex(pd.to_datetime(expected_dates, errors="coerce")).dropna()
+        if expected_index.empty:
+            return True
+        return bool(expected_index.normalize().isin(actual_dates).all())
 
     def _merge_cb_basic_parts(
         self, fixed: pd.DataFrame, mutable: pd.DataFrame
@@ -732,8 +1039,14 @@ class DataLoader:
         cached = (
             DataSchema.standardize("macro_daily", cached) if cached is not None else None
         )
+        expected_trade_days = self.calendar.get_open_days(start_ts, end_ts)
 
-        if refresh or not self._covers_time_series(cached, start_ts, end_ts, "trade_date"):
+        if refresh or not self._covers_expected_dates(
+            cached,
+            expected_trade_days,
+            "trade_date",
+            indicator_code="cb_equal_weight",
+        ):
             cross_section = self.get_cb_daily_cross_section(start_ts, end_ts, refresh=refresh)
             index_frame = self._build_cb_equal_weight_index(cross_section)
             merged = DataSchema.standardize(
