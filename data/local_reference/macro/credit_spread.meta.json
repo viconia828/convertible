@@ -1,7 +1,10 @@
 {
-  "mode": "fresh",
-  "coverage_start": "2025-01-01",
-  "coverage_end": "2026-04-15",
-  "rows": 318,
-  "source_table": "chinabond_queryYz_10y_AA_minus_treasury"
+  "mode": "fallback_local",
+  "coverage_start": "2024-08-28",
+  "coverage_end": "2026-04-19",
+  "rows": 405,
+  "source_table": "chinabond_queryYz_10y_AA_minus_treasury",
+  "active_source": "local_snapshot",
+  "registered_backups": [],
+  "last_error": "chinabond_queryYz: <urlopen error [WinError 10061] \u7531\u4e8e\u76ee\u6807\u8ba1\u7b97\u673a\u79ef\u6781\u62d2\u7edd\uff0c\u65e0\u6cd5\u8fde\u63a5\u3002>"
 }

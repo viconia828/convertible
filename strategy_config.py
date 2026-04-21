@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 
 DEFAULT_STRATEGY_CONFIG_PATH = Path(__file__).resolve().parent / "\u7b56\u7565\u53c2\u6570.txt"
-USER_EDITABLE_TOP_LEVEL_KEYS = frozenset({"env", "factor", "model"})
+USER_EDITABLE_TOP_LEVEL_KEYS = frozenset({"env", "factor", "model", "strategy"})
 
 DEFAULT_CONFIG_PAYLOAD: dict[str, Any] = {
     "meta": {
@@ -133,6 +133,16 @@ DEFAULT_CONFIG_PAYLOAD: dict[str, Any] = {
                 "trend": 0.07,
                 "stability": -0.03,
             },
+        },
+    },
+    "strategy": {
+        "history_buffer_calendar_days": 550,
+        "portfolio": {
+            "top_n": 15,
+            "min_names": 8,
+            "weighting_method": "score_proportional",
+            "single_name_max_weight": 0.12,
+            "cash_buffer": 0.0,
         },
     },
     "exports": {
@@ -265,6 +275,21 @@ class ModelParameters:
 
 
 @dataclass(frozen=True)
+class StrategyPortfolioParameters:
+    top_n: int
+    min_names: int
+    weighting_method: str
+    single_name_max_weight: float
+    cash_buffer: float
+
+
+@dataclass(frozen=True)
+class StrategyModuleParameters:
+    history_buffer_calendar_days: int
+    portfolio: StrategyPortfolioParameters
+
+
+@dataclass(frozen=True)
 class ExportParameters:
     output_dir: str
     excel_engine: str
@@ -287,6 +312,7 @@ class StrategyParameters:
     env: EnvironmentParameters
     factor: FactorParameters
     model: ModelParameters
+    strategy: StrategyModuleParameters
     exports: ExportParameters
     path: Path
     raw: dict[str, Any]
@@ -321,6 +347,7 @@ class StrategyParameters:
         env = payload["env"]
         factor = payload["factor"]
         model = payload["model"]
+        strategy = payload["strategy"]
         exports = payload["exports"]
 
         alignment_rules = {
@@ -423,6 +450,20 @@ class StrategyParameters:
                 min_weight=float(model["min_weight"]),
                 max_weight=float(model["max_weight"]),
                 smooth_alpha=float(model["smooth_alpha"]),
+            ),
+            strategy=StrategyModuleParameters(
+                history_buffer_calendar_days=int(
+                    strategy["history_buffer_calendar_days"]
+                ),
+                portfolio=StrategyPortfolioParameters(
+                    top_n=int(strategy["portfolio"]["top_n"]),
+                    min_names=int(strategy["portfolio"]["min_names"]),
+                    weighting_method=str(strategy["portfolio"]["weighting_method"]),
+                    single_name_max_weight=float(
+                        strategy["portfolio"]["single_name_max_weight"]
+                    ),
+                    cash_buffer=float(strategy["portfolio"]["cash_buffer"]),
+                ),
             ),
             exports=ExportParameters(
                 output_dir=str(exports["output_dir"]),

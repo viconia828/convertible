@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,63 @@ class FactorEngine:
         "trend": "trend_score",
         "stability": "stability_score",
     }
+    HISTORY_COLUMNS = (
+        "cb_code",
+        "trade_date",
+        "close",
+        "amount",
+        "premium_rate",
+        "ytm",
+        "convert_value",
+        "is_tradable",
+    )
+    SNAPSHOT_COLUMNS = (
+        "cb_code",
+        "trade_date",
+        "close",
+        "premium_rate",
+        "ytm",
+        "convert_value",
+        "is_tradable",
+        "momentum_60",
+        "volatility_60",
+        "amount_mean_20",
+        "listing_obs",
+    )
+    BASE_RESULT_COLUMNS = (
+        "cb_code",
+        "trade_date",
+        "close",
+        "premium_rate",
+        "ytm",
+        "remain_size",
+        "amount_mean_20",
+        *SCORE_COLUMNS,
+    )
+    RAW_FACTOR_COLUMNS = (
+        "double_low",
+        "value_raw",
+        "carry_raw",
+        "structure_raw",
+        "trend_raw",
+        "stability_raw",
+    )
+    DIAGNOSTIC_FLAG_COLUMNS = (
+        "eligible",
+        "exclude_reason",
+        "has_required_fields",
+        "is_recently_listed",
+        "is_size_ok",
+        "is_amount_ok",
+        "is_call_announced",
+        "is_put_triggered",
+        "is_tradable_now",
+    )
+    DIAGNOSTIC_COLUMNS = (
+        *BASE_RESULT_COLUMNS,
+        *RAW_FACTOR_COLUMNS,
+        *DIAGNOSTIC_FLAG_COLUMNS,
+    )
 
     def __init__(
         self,
@@ -111,12 +168,13 @@ class FactorEngine:
         cb_call: pd.DataFrame | None = None,
         cb_rate: pd.DataFrame | None = None,
         requested_codes: Iterable[str] | None = None,
+        on_ytm_estimated: Callable[[pd.DataFrame], None] | None = None,
     ) -> pd.DataFrame:
         """Compute scores plus eligibility diagnostics for the given date."""
 
         as_of_ts = pd.Timestamp(as_of_date).normalize()
         codes = list(dict.fromkeys(requested_codes or []))
-        history = cb_daily.loc[cb_daily["trade_date"].le(as_of_ts)].copy()
+        history = self._select_history_columns(cb_daily, end_ts=as_of_ts)
         if history.empty:
             return self._empty_result(include_diagnostics=True, requested_codes=codes, as_of_ts=as_of_ts)
 
@@ -127,6 +185,7 @@ class FactorEngine:
             cb_call=cb_call,
             as_of_ts=as_of_ts,
             cb_rate=cb_rate,
+            on_ytm_estimated=on_ytm_estimated,
         )
         diagnostics = self._score_snapshot(snapshot)
         if codes:
@@ -146,6 +205,7 @@ class FactorEngine:
         cb_call: pd.DataFrame | None = None,
         cb_rate: pd.DataFrame | None = None,
         requested_codes: Iterable[str] | None = None,
+        on_ytm_estimated: Callable[[pd.DataFrame], None] | None = None,
     ) -> pd.DataFrame:
         """Compute diagnostics for multiple trade days in one panel pass."""
 
@@ -158,61 +218,30 @@ class FactorEngine:
         )
         codes = list(dict.fromkeys(requested_codes or []))
         if len(normalized_days) == 0:
-            return pd.concat(
-                [
-                    self._empty_result(
-                        include_diagnostics=True,
-                        requested_codes=codes,
-                        as_of_ts=pd.Timestamp(day),
-                    )
-                    for day in normalized_days
-                ],
-                ignore_index=True,
-            ) if codes else self._empty_result(include_diagnostics=True)
+            return self._empty_panel_result(normalized_days, codes)
 
-        history = cb_daily.loc[
-            cb_daily["trade_date"].le(pd.Timestamp(normalized_days.max()))
-        ].copy()
+        history = self._select_history_columns(
+            cb_daily,
+            end_ts=pd.Timestamp(normalized_days.max()),
+        )
         if history.empty:
-            if not codes:
-                return self._empty_result(include_diagnostics=True)
-            return pd.concat(
-                [
-                    self._empty_result(
-                        include_diagnostics=True,
-                        requested_codes=codes,
-                        as_of_ts=pd.Timestamp(day),
-                    )
-                    for day in normalized_days
-                ],
-                ignore_index=True,
-            )
+            return self._empty_panel_result(normalized_days, codes)
 
         history = history.sort_values(["cb_code", "trade_date"], kind="stable")
         prepared = self._prepare_history_metrics(history)
         snapshot = prepared.loc[
-            prepared["trade_date"].isin(normalized_days)
+            prepared["trade_date"].isin(normalized_days),
+            list(self.SNAPSHOT_COLUMNS),
         ].copy()
         if snapshot.empty:
-            if not codes:
-                return self._empty_result(include_diagnostics=True)
-            return pd.concat(
-                [
-                    self._empty_result(
-                        include_diagnostics=True,
-                        requested_codes=codes,
-                        as_of_ts=pd.Timestamp(day),
-                    )
-                    for day in normalized_days
-                ],
-                ignore_index=True,
-            )
+            return self._empty_panel_result(normalized_days, codes)
 
         snapshot = self._enrich_snapshot_rows(
             snapshot=snapshot,
             cb_basic=cb_basic,
             cb_call=cb_call,
             cb_rate=cb_rate,
+            on_ytm_estimated=on_ytm_estimated,
         )
         diagnostics = self._score_snapshot(snapshot, group_column="trade_date")
         if codes:
@@ -249,40 +278,73 @@ class FactorEngine:
         cb_call: pd.DataFrame | None,
         as_of_ts: pd.Timestamp,
         cb_rate: pd.DataFrame | None = None,
+        on_ytm_estimated: Callable[[pd.DataFrame], None] | None = None,
     ) -> pd.DataFrame:
         working = self._prepare_history_metrics(history)
-        latest = (
-            working.groupby("cb_code", group_keys=False)
-            .tail(1)
-            .copy()
-        )
+        latest = working.loc[
+            ~working["cb_code"].duplicated(keep="last"),
+            list(self.SNAPSHOT_COLUMNS),
+        ].copy()
         latest["trade_date"] = as_of_ts
         return self._enrich_snapshot_rows(
             snapshot=latest,
             cb_basic=cb_basic,
             cb_call=cb_call,
             cb_rate=cb_rate,
+            on_ytm_estimated=on_ytm_estimated,
         )
+
+    def _select_history_columns(
+        self,
+        cb_daily: pd.DataFrame,
+        end_ts: pd.Timestamp,
+    ) -> pd.DataFrame:
+        history = cb_daily.loc[cb_daily["trade_date"].le(end_ts)].copy()
+        if history.empty:
+            return history
+
+        available_columns = [
+            column for column in self.HISTORY_COLUMNS if column in history.columns
+        ]
+        history = history.loc[:, available_columns].copy()
+        default_values: dict[str, object] = {
+            "amount": np.nan,
+            "premium_rate": np.nan,
+            "ytm": np.nan,
+            "convert_value": np.nan,
+            "is_tradable": False,
+        }
+        for column, default in default_values.items():
+            if column not in history.columns:
+                history[column] = default
+        return history.loc[:, list(self.HISTORY_COLUMNS)].copy()
 
     def _prepare_history_metrics(self, history: pd.DataFrame) -> pd.DataFrame:
         working = history.copy()
-        grouped = working.groupby("cb_code", group_keys=False)
-        working["daily_return"] = grouped["close"].pct_change()
-        working["momentum_60"] = grouped["close"].transform(
-            lambda series: series / series.shift(self.params.momentum_window) - 1.0
+        grouped = working.groupby("cb_code", sort=False)
+        close_grouped = grouped["close"]
+        working["daily_return"] = close_grouped.pct_change()
+        working["momentum_60"] = (
+            working["close"] / close_grouped.shift(self.params.momentum_window) - 1.0
         )
-        working["volatility_60"] = grouped["daily_return"].transform(
-            lambda series: series.rolling(
+        working["volatility_60"] = (
+            working.groupby("cb_code", sort=False)["daily_return"]
+            .rolling(
                 self.params.volatility_window,
                 min_periods=self.params.volatility_min_periods,
-            ).std()
+            )
+            .std()
+            .reset_index(level=0, drop=True)
             * math.sqrt(self.params.annualization_days)
         )
-        working["amount_mean_20"] = grouped["amount"].transform(
-            lambda series: series.rolling(
+        working["amount_mean_20"] = (
+            working.groupby("cb_code", sort=False)["amount"]
+            .rolling(
                 self.params.amount_mean_window,
                 min_periods=self.params.amount_mean_min_periods,
-            ).mean()
+            )
+            .mean()
+            .reset_index(level=0, drop=True)
         )
         working["listing_obs"] = grouped.cumcount() + 1
         return working
@@ -293,22 +355,17 @@ class FactorEngine:
         cb_basic: pd.DataFrame,
         cb_call: pd.DataFrame | None,
         cb_rate: pd.DataFrame | None = None,
+        on_ytm_estimated: Callable[[pd.DataFrame], None] | None = None,
     ) -> pd.DataFrame:
         latest = snapshot.copy()
-        basic_latest = cb_basic.drop_duplicates(subset=["cb_code"], keep="last").copy()
-        latest = latest.merge(
-            basic_latest[
-                [
-                    "cb_code",
-                    "remain_size",
-                    "list_date",
-                    "delist_date",
-                    "conv_stop_date",
-                ]
-            ],
-            on="cb_code",
-            how="left",
-        )
+        if not cb_basic.empty:
+            basic_latest = (
+                cb_basic.drop_duplicates(subset=["cb_code"], keep="last")
+                .set_index("cb_code")[["remain_size"]]
+            )
+            latest = latest.join(basic_latest, on="cb_code")
+        elif "remain_size" not in latest.columns:
+            latest["remain_size"] = pd.NA
 
         if "premium_rate" in latest.columns and "convert_value" in latest.columns:
             missing_premium = latest["premium_rate"].isna() & latest["convert_value"].gt(0)
@@ -328,6 +385,13 @@ class FactorEngine:
                 cb_rate=cb_rate if cb_rate is not None else pd.DataFrame(),
             )
             latest.loc[missing_ytm, "ytm"] = estimated.to_numpy()
+            if on_ytm_estimated is not None:
+                estimated_rows = latest.loc[
+                    missing_ytm,
+                    ["cb_code", "trade_date", "ytm"],
+                ].dropna(subset=["ytm"])
+                if not estimated_rows.empty:
+                    on_ytm_estimated(estimated_rows.reset_index(drop=True))
 
         latest["is_call_announced"] = False
         if cb_call is not None and not cb_call.empty:
@@ -383,37 +447,16 @@ class FactorEngine:
         for column in self.SCORE_COLUMNS:
             scored[column] = np.nan
 
+        eligible_index = scored.index[scored["eligible"]].tolist()
         if group_column is None:
-            self._assign_cross_section_scores(scored, scored.index[scored["eligible"]].tolist())
+            self._assign_cross_section_scores(scored, eligible_index)
         else:
-            for _, index in scored.groupby(group_column, sort=True).groups.items():
-                group_index = list(index)
-                eligible_index = scored.loc[group_index].index[scored.loc[group_index, "eligible"]].tolist()
-                self._assign_cross_section_scores(scored, eligible_index)
+            eligible_frame = scored.loc[eligible_index, [group_column]]
+            for _, index in eligible_frame.groupby(group_column, sort=False).groups.items():
+                self._assign_cross_section_scores(scored, list(index))
 
-        scored["exclude_reason"] = scored.apply(self._build_exclude_reason, axis=1)
-        return scored.loc[
-            :,
-            [
-                "cb_code",
-                "trade_date",
-                "close",
-                "premium_rate",
-                "ytm",
-                "remain_size",
-                "amount_mean_20",
-                *self.SCORE_COLUMNS,
-                "eligible",
-                "exclude_reason",
-                "has_required_fields",
-                "is_recently_listed",
-                "is_size_ok",
-                "is_amount_ok",
-                "is_call_announced",
-                "is_put_triggered",
-                "is_tradable_now",
-            ],
-        ].copy()
+        scored["exclude_reason"] = self._build_exclude_reasons(scored)
+        return scored.loc[:, list(self.DIAGNOSTIC_COLUMNS)].copy()
 
     def _assign_cross_section_scores(
         self,
@@ -450,23 +493,26 @@ class FactorEngine:
             & snapshot["has_required_fields"]
         )
 
-    def _build_exclude_reason(self, row: pd.Series) -> str:
-        reasons: list[str] = []
-        if not bool(row.get("has_required_fields", False)):
-            reasons.append("missing_required_fields")
-        if bool(row.get("is_recently_listed", False)):
-            reasons.append("recently_listed")
-        if not bool(row.get("is_size_ok", False)):
-            reasons.append("remain_size_below_min")
-        if not bool(row.get("is_amount_ok", False)):
-            reasons.append("amount_below_min")
-        if bool(row.get("is_call_announced", False)):
-            reasons.append("call_announced")
-        if bool(row.get("is_put_triggered", False)):
-            reasons.append("put_triggered")
-        if not bool(row.get("is_tradable_now", False)):
-            reasons.append("not_tradable")
-        return "" if not reasons else ",".join(reasons)
+    def _build_exclude_reasons(self, frame: pd.DataFrame) -> pd.Series:
+        reasons = pd.Series("", index=frame.index, dtype="object")
+        rule_masks = (
+            ("missing_required_fields", ~frame["has_required_fields"].fillna(False)),
+            ("recently_listed", frame["is_recently_listed"].fillna(False)),
+            ("remain_size_below_min", ~frame["is_size_ok"].fillna(False)),
+            ("amount_below_min", ~frame["is_amount_ok"].fillna(False)),
+            ("call_announced", frame["is_call_announced"].fillna(False)),
+            ("put_triggered", frame["is_put_triggered"].fillna(False)),
+            ("not_tradable", ~frame["is_tradable_now"].fillna(False)),
+        )
+        for label, mask in rule_masks:
+            active = mask.astype(bool)
+            if not active.any():
+                continue
+            empty_mask = active & reasons.eq("")
+            append_mask = active & ~empty_mask
+            reasons.loc[empty_mask] = label
+            reasons.loc[append_mask] = reasons.loc[append_mask] + "," + label
+        return reasons
 
     def _append_missing_requested_diagnostics(
         self,
@@ -518,6 +564,24 @@ class FactorEngine:
         ]
         return pd.concat([frame, *placeholders], ignore_index=True, sort=False)
 
+    def _empty_panel_result(
+        self,
+        trade_days: Iterable[pd.Timestamp],
+        requested_codes: list[str],
+    ) -> pd.DataFrame:
+        normalized_days = list(pd.DatetimeIndex(trade_days))
+        if not requested_codes or not normalized_days:
+            return self._empty_result(include_diagnostics=True)
+        placeholders = [
+            self._empty_result(
+                include_diagnostics=True,
+                requested_codes=requested_codes,
+                as_of_ts=pd.Timestamp(day),
+            )
+            for day in normalized_days
+        ]
+        return pd.concat(placeholders, ignore_index=True, sort=False)
+
     def _winsorize(self, series: pd.Series) -> pd.Series:
         valid = series.dropna()
         if valid.empty:
@@ -563,30 +627,11 @@ class FactorEngine:
         requested_codes: list[str] | None = None,
         as_of_ts: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
-        base_columns = [
-            "cb_code",
-            "trade_date",
-            "close",
-            "premium_rate",
-            "ytm",
-            "remain_size",
-            "amount_mean_20",
-            *self.SCORE_COLUMNS,
-        ]
+        base_columns = list(self.BASE_RESULT_COLUMNS)
         if not include_diagnostics:
             return pd.DataFrame(columns=base_columns)
 
-        diagnostics_columns = base_columns + [
-            "eligible",
-            "exclude_reason",
-            "has_required_fields",
-            "is_recently_listed",
-            "is_size_ok",
-            "is_amount_ok",
-            "is_call_announced",
-            "is_put_triggered",
-            "is_tradable_now",
-        ]
+        diagnostics_columns = list(self.DIAGNOSTIC_COLUMNS)
         if not requested_codes or as_of_ts is None:
             return pd.DataFrame(columns=diagnostics_columns)
 

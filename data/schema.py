@@ -289,7 +289,10 @@ class DataSchema:
                 f"{dataset_name} is missing required key columns: {missing_keys}"
             )
 
-        if dataset_name in {"cb_daily", "stock_daily"}:
+        if dataset_name in {"cb_daily", "stock_daily"} and {
+            "volume",
+            "amount",
+        }.issubset(normalized.columns):
             normalized["is_tradable"] = (
                 normalized["volume"].fillna(0).gt(0)
                 & normalized["amount"].fillna(0).gt(0)

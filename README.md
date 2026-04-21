@@ -16,11 +16,11 @@
 
 ## 当前进度
 
-截至 `2026-04-20`，项目进度可以按阶段理解：
+截至 `2026-04-21`，项目进度可以按阶段理解：
 
 - 阶段 1，数据层、环境打分、因子打分：已基本可用
 - 阶段 2，环境到因子权重的映射：已有 baseline 实现
-- 阶段 3，策略引擎、组合构建、回测验证：尚未正式展开
+- 阶段 3，策略引擎、组合构建、回测验证：已进入第一阶段骨架与单日期预览入口
 
 当前已经落地的关键能力：
 
@@ -41,6 +41,10 @@
   - `cb_daily_cross_section`、`cb_daily`、`cb_rate` 都支持只补缺口和有限并发
   - 因子打分已改为全市场批量面板计算，而不是逐日全量重算
   - 因子预热历史已改为动态窗口，而不是固定长历史
+- `strategy` 已具备单日期预览主链
+  - 已可联通 `snapshot -> env/factors -> weights -> portfolio`
+  - 支持单日期预览环境分数、因子权重和目标组合
+  - 当前仍是“预览 / 联调入口”，还不是正式回测模块
 
 ## 当前重要规则
 
@@ -70,6 +74,9 @@
 - 因子打分：
   - [因子打分.bat](C:/Users/ai/Desktop/可转债多因子/因子打分.bat)
   - [export_factor_scores.py](C:/Users/ai/Desktop/可转债多因子/tools/export_factor_scores.py)
+- 策略预览：
+  - [策略预览.bat](C:/Users/ai/Desktop/可转债多因子/策略预览.bat)
+  - [preview_strategy.py](C:/Users/ai/Desktop/可转债多因子/tools/preview_strategy.py)
 - 参数文件：
   - [策略参数.txt](C:/Users/ai/Desktop/可转债多因子/策略参数.txt)
 - 导出结果目录：
@@ -122,10 +129,17 @@ python tools/export_environment_scores.py --interactive
 python tools/export_factor_scores.py --interactive
 ```
 
+策略预览：
+
+```bash
+python tools/preview_strategy.py --interactive
+```
+
 也可以直接使用桌面批处理入口：
 
 - [环境打分.bat](C:/Users/ai/Desktop/可转债多因子/环境打分.bat)
 - [因子打分.bat](C:/Users/ai/Desktop/可转债多因子/因子打分.bat)
+- [策略预览.bat](C:/Users/ai/Desktop/可转债多因子/策略预览.bat)
 
 ## 验证建议
 
@@ -139,10 +153,10 @@ python -m unittest tests.test_strategy_config tests.test_tushare_client tests.te
 
 如果是新的协作开发者接手，建议优先按这个顺序继续：
 
-1. 确认因子打分导出字段到底是走“更多原始诊断列”还是“更精简展示列”。
-2. 继续优化批量因子计算中的 YTM 估值与内存占用。
-3. 评估环境打分预热窗口和 `cb_daily_cross_section` 聚合缓存的进一步提速空间。
-4. 在以上事项收口后，再进入 `strategy` 模块，搭建 `snapshot -> env/factors/weights -> portfolio` 主链路。
+1. 评估是否为 `strategy` 预览入口补“指定候选代码 / 观察名单”视角。
+2. 评估是否给 `strategy` 预览补一个 `summary only / verbose` 开关，优化日常实跑阅读体验。
+3. 评估是否继续把环境 `warmup_first_ready_date` / `trend_first_ready_date` 一类解析也收口成共享 helper。
+4. 在以上事项收口后，再继续往批量预览、调仓流程和回测主链路推进。
 
 ## 已知风险
 

@@ -15,6 +15,8 @@ class StrategyConfigTests(unittest.TestCase):
         self.assertFalse(config.factor.export_default_refresh)
         self.assertEqual(config.factor.min_listing_days, 30)
         self.assertEqual(config.model.base_weights["value"], 0.25)
+        self.assertEqual(config.strategy.history_buffer_calendar_days, 550)
+        self.assertEqual(config.strategy.portfolio.top_n, 15)
         self.assertEqual(config.exports.factor_max_codes_per_run, 20)
 
     def test_runtime_overrides_only_affect_current_load(self) -> None:
@@ -31,6 +33,13 @@ class StrategyConfigTests(unittest.TestCase):
                 "exports": {
                     "factor_max_codes_per_run": 5,
                 },
+                "strategy": {
+                    "history_buffer_calendar_days": 420,
+                    "portfolio": {
+                        "top_n": 10,
+                        "single_name_max_weight": 0.15,
+                    },
+                },
             }
         )
 
@@ -40,6 +49,11 @@ class StrategyConfigTests(unittest.TestCase):
         self.assertFalse(base.factor.export_default_refresh)
         self.assertTrue(overridden.factor.export_default_refresh)
         self.assertEqual(overridden.factor.min_listing_days, 45)
+        self.assertEqual(base.strategy.history_buffer_calendar_days, 550)
+        self.assertEqual(overridden.strategy.history_buffer_calendar_days, 420)
+        self.assertEqual(base.strategy.portfolio.top_n, 15)
+        self.assertEqual(overridden.strategy.portfolio.top_n, 10)
+        self.assertEqual(overridden.strategy.portfolio.single_name_max_weight, 0.15)
         self.assertEqual(base.exports.factor_max_codes_per_run, 20)
         self.assertEqual(overridden.exports.factor_max_codes_per_run, 5)
 

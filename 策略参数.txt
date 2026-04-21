@@ -156,6 +156,22 @@ annualization_days = 252
 # z-score 标准差自由度参数
 zscore_ddof = 0
 
+[strategy]
+# strategy 主链路构造 snapshot 时使用的统一历史缓冲区间（自然日）
+history_buffer_calendar_days = 550
+
+[strategy.portfolio]
+# 目标组合默认选取的 top N 债券数量
+top_n = 15
+# 当日可建仓标的少于该数量时，允许不足额持有，但会在诊断中提示
+min_names = 8
+# 组合权重构建方式：score_proportional 或 equal_weight
+weighting_method = "score_proportional"
+# 单债目标权重上限
+single_name_max_weight = 0.12
+# 组合预留现金比例
+cash_buffer = 0.0
+
 [model]
 # 单因子最小权重下限
 min_weight = 0.05

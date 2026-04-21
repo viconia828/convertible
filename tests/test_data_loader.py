@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from data.data_loader import DataLoader
+from data.schema import DataSchema
 
 TMP_ROOT = Path(__file__).resolve().parent / "_tmp"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -415,6 +416,47 @@ class DataLoaderTests(unittest.TestCase):
         self.assertEqual(len(cb_rate_calls), 1)
         self.assertEqual(cb_rate_calls[0][1]["ts_code"], "110002.SH")
 
+    def test_cb_rate_can_batch_load_cached_codes_without_remote_calls(self) -> None:
+        client = FakeTushareClient(
+            {
+                "cb_rate": pd.DataFrame(
+                    columns=[
+                        "ts_code",
+                        "rate_freq",
+                        "rate_start_date",
+                        "rate_end_date",
+                        "coupon_rate",
+                    ]
+                )
+            }
+        )
+
+        case_dir = make_case_dir("cb_rate_batch_cache")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.CB_RATE_BATCH_CACHE_THRESHOLD = 2
+        for code, coupon in [("110001.SH", 5.0), ("110002.SH", 3.0)]:
+            loader.cache_store.save_time_series(
+                loader.source_name,
+                "cb_rate",
+                code,
+                pd.DataFrame(
+                    [
+                        {
+                            "cb_code": code,
+                            "rate_frequency": 1,
+                            "rate_start_date": "2025-04-01",
+                            "rate_end_date": "2026-04-01",
+                            "coupon_rate": coupon,
+                        }
+                    ]
+                ),
+            )
+
+        frame = loader.get_cb_rate(["110001.SH", "110002.SH"])
+
+        self.assertEqual(set(frame["cb_code"]), {"110001.SH", "110002.SH"})
+        self.assertEqual(len(client.calls), 0)
+
     def test_cb_call_can_cache_and_filter(self) -> None:
         client = FakeTushareClient(
             {
@@ -448,6 +490,56 @@ class DataLoaderTests(unittest.TestCase):
         self.assertEqual(frame.iloc[0]["call_status"], "公告强赎")
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(frame_again), 1)
+
+    def test_persist_cb_daily_cross_section_derived_fields_fills_missing_ytm(self) -> None:
+        client = FakeTushareClient({"trade_cal": pd.DataFrame()})
+
+        case_dir = make_case_dir("persist_cross_section_derived_fields")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.cache_store.save_time_series(
+            loader.source_name,
+            "cb_daily_cross_section",
+            "20260401",
+            pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "trade_date": "2026-04-01",
+                        "pre_close": 100.0,
+                        "open": 101.0,
+                        "high": 101.0,
+                        "low": 99.0,
+                        "close": 101.0,
+                        "price_change": 1.0,
+                        "pct_change": 1.0,
+                        "volume": 10.0,
+                        "amount": 20.0,
+                        "ytm": pd.NA,
+                        "is_tradable": True,
+                    }
+                ]
+            ),
+        )
+
+        loader.persist_cb_daily_cross_section_derived_fields(
+            pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "trade_date": pd.Timestamp("2026-04-01"),
+                        "ytm": 0.052,
+                    }
+                ]
+            )
+        )
+
+        cached = loader.cache_store.load_time_series(
+            loader.source_name,
+            "cb_daily_cross_section",
+            "20260401",
+        )
+        cached = DataSchema.standardize("cb_daily", cached)
+        self.assertAlmostEqual(float(cached.iloc[0]["ytm"]), 0.052, places=6)
 
     def test_macro_daily_supports_direct_index_and_curve_indicators(self) -> None:
         client = FakeTushareClient(
@@ -507,6 +599,69 @@ class DataLoaderTests(unittest.TestCase):
         self.assertEqual(set(frame["indicator_code"]), {"csi300", "csi300_amount", "bond_index", "treasury_10y"})
         treasury_value = float(frame.loc[frame["indicator_code"] == "treasury_10y", "value"].iloc[0])
         self.assertAlmostEqual(treasury_value, 1.80, places=6)
+
+    def test_macro_daily_auto_refreshes_credit_spread_reference_when_coverage_is_short(self) -> None:
+        case_dir = make_case_dir("macro_credit_spread_auto_refresh")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=FakeTushareClient({}))
+        reference_path = loader.cache_service.reference_frame_path("macro", "credit_spread")
+        reference_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            {
+                "trade_date": pd.to_datetime(["2025-01-01", "2025-01-02"]),
+                "value": [0.91, 0.92],
+                "indicator_code": ["credit_spread"] * 2,
+                "source_table": ["local_snapshot"] * 2,
+            }
+        ).to_csv(reference_path, index=False, encoding="utf-8-sig")
+
+        refresh_calls: list[tuple[pd.Timestamp, pd.Timestamp, bool]] = []
+
+        def fake_refresh(
+            start_date: object,
+            end_date: object,
+            use_existing_on_failure: bool = True,
+            primary_source=None,
+            backup_sources=None,
+        ) -> pd.DataFrame:
+            refresh_calls.append(
+                (
+                    pd.Timestamp(start_date).normalize(),
+                    pd.Timestamp(end_date).normalize(),
+                    bool(use_existing_on_failure),
+                )
+            )
+            merged = DataSchema.standardize(
+                "macro_daily",
+                pd.DataFrame(
+                    {
+                        "trade_date": pd.to_datetime(
+                            ["2024-12-02", "2024-12-03", "2025-01-01", "2025-01-02"]
+                        ),
+                        "value": [0.89, 0.90, 0.91, 0.92],
+                        "indicator_code": ["credit_spread"] * 4,
+                        "source_table": ["refreshed"] * 4,
+                    }
+                ),
+            )
+            merged.to_csv(reference_path, index=False, encoding="utf-8-sig")
+            return merged
+
+        loader.refresh_credit_spread_reference = fake_refresh
+
+        frame = loader.get_macro_daily(
+            ["credit_spread"],
+            "2024-12-02",
+            "2025-01-02",
+        )
+
+        self.assertEqual(len(refresh_calls), 1)
+        self.assertEqual(
+            refresh_calls[0],
+            (pd.Timestamp("2024-12-02"), pd.Timestamp("2025-01-02"), True),
+        )
+        self.assertEqual(frame["trade_date"].min(), pd.Timestamp("2024-12-02"))
+        self.assertEqual(frame["trade_date"].max(), pd.Timestamp("2025-01-02"))
+        self.assertTrue((frame["indicator_code"] == "credit_spread").all())
 
     def test_cb_equal_weight_index_can_be_built_from_cross_section(self) -> None:
         client = FakeTushareClient(
@@ -684,6 +839,325 @@ class DataLoaderTests(unittest.TestCase):
         cb_daily_calls = [call for call in client.calls if call[0] == "cb_daily"]
         self.assertEqual(len(cb_daily_calls), 1)
         self.assertEqual(cb_daily_calls[0][1]["trade_date"], "20260402")
+
+    def test_cb_daily_cross_section_can_batch_load_cached_days_without_remote_calls(self) -> None:
+        client = FakeTushareClient(
+            {
+                "trade_cal": pd.DataFrame(
+                    [
+                        {"exchange": "SSE", "cal_date": "20260401", "is_open": 1, "pretrade_date": "20260331"},
+                        {"exchange": "SSE", "cal_date": "20260402", "is_open": 1, "pretrade_date": "20260401"},
+                    ]
+                ),
+                "cb_daily": pd.DataFrame(
+                    columns=[
+                        "ts_code",
+                        "trade_date",
+                        "pre_close",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "change",
+                        "pct_chg",
+                        "vol",
+                        "amount",
+                    ]
+                ),
+            }
+        )
+
+        case_dir = make_case_dir("cb_daily_cross_section_batch_cache")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD = 2
+        for trade_date, code, close in [
+            ("2026-04-01", "110001.SH", 101.0),
+            ("2026-04-02", "110002.SH", 102.0),
+        ]:
+            loader.cache_store.save_time_series(
+                loader.source_name,
+                "cb_daily_cross_section",
+                trade_date.replace("-", ""),
+                pd.DataFrame(
+                    [
+                        {
+                            "cb_code": code,
+                            "trade_date": trade_date,
+                            "pre_close": close - 1.0,
+                            "open": close,
+                            "high": close,
+                            "low": close - 2.0,
+                            "close": close,
+                            "price_change": 1.0,
+                            "pct_change": 1.0,
+                            "volume": 10.0,
+                            "amount": 20.0,
+                            "ytm": pd.NA,
+                            "is_tradable": True,
+                        }
+                    ]
+                ),
+            )
+
+        frame = loader.get_cb_daily_cross_section("2026-04-01", "2026-04-02")
+
+        self.assertEqual(len(frame), 2)
+        self.assertEqual(set(frame["cb_code"]), {"110001.SH", "110002.SH"})
+        cb_daily_calls = [call for call in client.calls if call[0] == "cb_daily"]
+        self.assertEqual(len(cb_daily_calls), 0)
+
+    def test_cb_daily_cross_section_can_project_columns_from_cached_days(self) -> None:
+        client = FakeTushareClient(
+            {
+                "trade_cal": pd.DataFrame(
+                    [
+                        {"exchange": "SSE", "cal_date": "20260401", "is_open": 1, "pretrade_date": "20260331"},
+                        {"exchange": "SSE", "cal_date": "20260402", "is_open": 1, "pretrade_date": "20260401"},
+                    ]
+                ),
+                "cb_daily": pd.DataFrame(columns=["ts_code", "trade_date"]),
+            }
+        )
+
+        case_dir = make_case_dir("cb_daily_cross_section_projection")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD = 2
+        for trade_date, code, close in [
+            ("2026-04-01", "110001.SH", 101.0),
+            ("2026-04-02", "110002.SH", 102.0),
+        ]:
+            loader.cache_store.save_time_series(
+                loader.source_name,
+                "cb_daily_cross_section",
+                trade_date.replace("-", ""),
+                pd.DataFrame(
+                    [
+                        {
+                            "cb_code": code,
+                            "trade_date": trade_date,
+                            "pre_close": close - 1.0,
+                            "open": close,
+                            "high": close,
+                            "low": close - 2.0,
+                            "close": close,
+                            "price_change": 1.0,
+                            "pct_change": 1.0,
+                            "volume": 10.0,
+                            "amount": 20.0,
+                            "convert_value": 95.0,
+                            "premium_rate": 3.0,
+                            "ytm": pd.NA,
+                            "is_tradable": True,
+                        }
+                    ]
+                ),
+            )
+
+        frame = loader.get_cb_daily_cross_section(
+            "2026-04-01",
+            "2026-04-02",
+            columns=["cb_code", "trade_date", "close", "amount", "ytm"],
+        )
+
+        self.assertEqual(
+            list(frame.columns),
+            ["cb_code", "trade_date", "close", "amount", "ytm"],
+        )
+        self.assertEqual(len(frame), 2)
+        cb_daily_calls = [call for call in client.calls if call[0] == "cb_daily"]
+        self.assertEqual(len(cb_daily_calls), 0)
+
+    def test_cb_daily_cross_section_can_build_and_reuse_request_panel_cache(self) -> None:
+        client = FakeTushareClient(
+            {
+                "trade_cal": pd.DataFrame(
+                    [
+                        {"exchange": "SSE", "cal_date": "20260401", "is_open": 1, "pretrade_date": "20260331"},
+                        {"exchange": "SSE", "cal_date": "20260402", "is_open": 1, "pretrade_date": "20260401"},
+                    ]
+                ),
+                "cb_daily": pd.DataFrame(columns=["ts_code", "trade_date"]),
+            }
+        )
+
+        case_dir = make_case_dir("cb_daily_cross_section_monthly_aggregate")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD = 2
+        loader.CB_DAILY_CROSS_SECTION_AGGREGATE_MIN_DAYS = 2
+        requested_columns = [
+            "cb_code",
+            "trade_date",
+            "close",
+            "amount",
+            "premium_rate",
+            "ytm",
+            "convert_value",
+            "is_tradable",
+        ]
+        for trade_date, code, close in [
+            ("2026-04-01", "110001.SH", 101.0),
+            ("2026-04-02", "110002.SH", 102.0),
+        ]:
+            loader.cache_store.save_time_series(
+                loader.source_name,
+                "cb_daily_cross_section",
+                trade_date.replace("-", ""),
+                pd.DataFrame(
+                    [
+                        {
+                            "cb_code": code,
+                            "trade_date": trade_date,
+                            "close": close,
+                            "amount": 20.0,
+                            "premium_rate": 3.0,
+                            "ytm": pd.NA,
+                            "convert_value": 95.0,
+                            "is_tradable": True,
+                        }
+                    ]
+                ),
+            )
+
+        first = loader.get_cb_daily_cross_section(
+            "2026-04-01",
+            "2026-04-02",
+            columns=requested_columns,
+            aggregate_profile="factor_history_v1",
+        )
+        aggregate_dir = (
+            case_dir
+            / "cache"
+            / loader.source_name
+            / "time_series_aggregate"
+            / "cb_daily_cross_section"
+            / "factor_history_v1"
+        )
+        self.assertTrue((aggregate_dir / "202604.csv").exists())
+        self.assertTrue((aggregate_dir / "202604.meta.json").exists())
+
+        shutil.rmtree(case_dir / "cache" / loader.source_name / "time_series")
+        shutil.rmtree(case_dir / "cache" / loader.source_name / "time_series_aggregate")
+        calls_before = len([call for call in client.calls if call[0] == "cb_daily"])
+        second = loader.get_cb_daily_cross_section(
+            "2026-04-01",
+            "2026-04-02",
+            columns=requested_columns,
+            aggregate_profile="factor_history_v1",
+        )
+        calls_after = len([call for call in client.calls if call[0] == "cb_daily"])
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(calls_before, calls_after)
+        self.assertGreaterEqual(
+            loader.cache_service.stats_snapshot().get(
+                "panel_memory_hit_calls::cb_daily_cross_section::factor_history_v1",
+                0,
+            ),
+            1,
+        )
+
+    def test_cb_daily_cross_section_writeback_invalidates_aggregate_and_request_panel(self) -> None:
+        client = FakeTushareClient(
+            {
+                "trade_cal": pd.DataFrame(
+                    [
+                        {"exchange": "SSE", "cal_date": "20260401", "is_open": 1, "pretrade_date": "20260331"},
+                        {"exchange": "SSE", "cal_date": "20260402", "is_open": 1, "pretrade_date": "20260401"},
+                    ]
+                ),
+                "cb_daily": pd.DataFrame(columns=["ts_code", "trade_date"]),
+            }
+        )
+
+        case_dir = make_case_dir("cb_daily_cross_section_writeback_invalidation")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD = 2
+        loader.CB_DAILY_CROSS_SECTION_AGGREGATE_MIN_DAYS = 2
+        requested_columns = [
+            "cb_code",
+            "trade_date",
+            "close",
+            "amount",
+            "premium_rate",
+            "ytm",
+            "convert_value",
+            "is_tradable",
+        ]
+        for trade_date, code, close in [
+            ("2026-04-01", "110001.SH", 101.0),
+            ("2026-04-02", "110002.SH", 102.0),
+        ]:
+            loader.cache_store.save_time_series(
+                loader.source_name,
+                "cb_daily_cross_section",
+                trade_date.replace("-", ""),
+                pd.DataFrame(
+                    [
+                        {
+                            "cb_code": code,
+                            "trade_date": trade_date,
+                            "close": close,
+                            "amount": 20.0,
+                            "premium_rate": 3.0,
+                            "ytm": pd.NA,
+                            "convert_value": 95.0,
+                            "is_tradable": True,
+                        }
+                    ]
+                ),
+            )
+
+        first = loader.get_cb_daily_cross_section(
+            "2026-04-01",
+            "2026-04-02",
+            columns=requested_columns,
+            aggregate_profile="factor_history_v1",
+        )
+        aggregate_dir = (
+            case_dir
+            / "cache"
+            / loader.source_name
+            / "time_series_aggregate"
+            / "cb_daily_cross_section"
+            / "factor_history_v1"
+        )
+        self.assertTrue((aggregate_dir / "202604.csv").exists())
+        self.assertTrue((aggregate_dir / "202604.meta.json").exists())
+        self.assertEqual(int(first["ytm"].isna().sum()), 2)
+
+        loader.persist_cb_daily_cross_section_derived_fields(
+            pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "trade_date": pd.Timestamp("2026-04-01"),
+                        "ytm": 0.052,
+                    }
+                ]
+            )
+        )
+
+        self.assertFalse((aggregate_dir / "202604.csv").exists())
+        self.assertFalse((aggregate_dir / "202604.meta.json").exists())
+
+        second = loader.get_cb_daily_cross_section(
+            "2026-04-01",
+            "2026-04-02",
+            columns=requested_columns,
+            aggregate_profile="factor_history_v1",
+        )
+
+        updated = second.set_index("cb_code")["ytm"]
+        self.assertAlmostEqual(float(updated["110001.SH"]), 0.052, places=6)
+        self.assertTrue(pd.isna(updated["110002.SH"]))
+        self.assertGreaterEqual(
+            loader.cache_service.stats_snapshot().get(
+                "panel_memory_invalidation_calls::cb_daily_cross_section",
+                0,
+            ),
+            1,
+        )
 
     def test_cb_equal_weight_index_refetches_when_cached_dates_have_gap(self) -> None:
         client = FakeTushareClient(

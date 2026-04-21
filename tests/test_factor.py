@@ -146,6 +146,36 @@ class FactorEngineTests(unittest.TestCase):
 
         self.assertEqual(set(result["cb_code"]), {"CB_A"})
 
+    def test_compute_with_diagnostics_includes_raw_factor_columns(self) -> None:
+        cb_daily, cb_basic, cb_call = self._make_history()
+        engine = FactorEngine(min_avg_amount_20=200.0)
+
+        diagnostics = engine.compute_with_diagnostics(
+            "2026-04-22",
+            cb_daily,
+            cb_basic,
+            cb_call,
+        )
+
+        for column in (
+            "double_low",
+            "value_raw",
+            "carry_raw",
+            "structure_raw",
+            "trend_raw",
+            "stability_raw",
+            "exclude_reason",
+        ):
+            self.assertIn(column, diagnostics.columns)
+        self.assertGreater(
+            float(
+                diagnostics.loc[diagnostics["cb_code"] == "CB_B", "double_low"].iloc[0]
+            ),
+            float(
+                diagnostics.loc[diagnostics["cb_code"] == "CB_A", "double_low"].iloc[0]
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

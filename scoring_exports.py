@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +13,53 @@ import pandas as pd
 from data import DataLoader
 from env import EnvironmentDetector, MacroAlignmentSummary
 from factor import FactorEngine
+from history_windows import (
+    build_history_notes as _build_history_notes,
+    inspect_local_env_history_start as _local_env_history_start,
+    inspect_local_factor_history_start as _local_factor_history_start,
+    max_available_history_start as _max_timestamp,
+    recommended_factor_history_buffer_calendar_days as _recommended_factor_history_buffer_calendar_days,
+    resolve_environment_report_history_start,
+    resolve_environment_warmup_history_start as _resolve_environment_export_history_start,
+    resolve_factor_report_history_start,
+    safe_min_timestamp as _safe_min_timestamp,
+)
+from reporting_semantics import (
+    DATA_QUALITY_STATUS_OK,
+    DEFAULT_FETCH_POLICY,
+    build_data_quality_warning_note,
+    resolve_data_quality_status,
+    yes_no_label,
+)
 from strategy_config import StrategyParameters, load_strategy_parameters
+
+FACTOR_SCORE_DISPLAY_COLUMNS = (
+    "trade_date",
+    "cb_code",
+    "baseline_total_score",
+    *FactorEngine.SCORE_COLUMNS,
+    "eligible",
+    "exclude_reason",
+    "close",
+    "premium_rate",
+    "ytm",
+    "remain_size",
+    "amount_mean_20",
+)
+
+FACTOR_DIAGNOSTIC_EXPORT_COLUMNS = (
+    "trade_date",
+    "cb_code",
+    "baseline_total_score",
+    "close",
+    "premium_rate",
+    "ytm",
+    "remain_size",
+    "amount_mean_20",
+    *FactorEngine.RAW_FACTOR_COLUMNS,
+    *FactorEngine.SCORE_COLUMNS,
+    *FactorEngine.DIAGNOSTIC_FLAG_COLUMNS,
+)
 
 
 ENV_SUMMARY_INDICATOR_LABELS = {
@@ -46,9 +91,12 @@ class EnvironmentScoreReport:
     requested_end: pd.Timestamp
     history_start_requested: pd.Timestamp
     history_start_used: pd.Timestamp
-    fetch_policy: str = "缓存优先，完整性优先"
+    warmup_first_ready_date: pd.Timestamp | None = None
+    trend_first_ready_date: pd.Timestamp | None = None
+    warmup_trade_days_excluded: int = 0
+    fetch_policy: str = DEFAULT_FETCH_POLICY
     refresh_requested: bool = False
-    data_quality_status: str = "正常"
+    data_quality_status: str = DATA_QUALITY_STATUS_OK
     notes: tuple[str, ...] = ()
 
 
@@ -61,9 +109,9 @@ class FactorScoreReport:
     history_start_requested: pd.Timestamp
     history_start_used: pd.Timestamp
     codes: list[str]
-    fetch_policy: str = "缓存优先，完整性优先"
+    fetch_policy: str = DEFAULT_FETCH_POLICY
     refresh_requested: bool = False
-    data_quality_status: str = "正常"
+    data_quality_status: str = DATA_QUALITY_STATUS_OK
     notes: tuple[str, ...] = ()
 
 
@@ -87,13 +135,32 @@ def build_environment_score_report(
     if start_ts > end_ts:
         raise ValueError("start_date must be <= end_date")
 
-    history_start = start_ts - pd.Timedelta(
-        days=config.exports.env_history_buffer_calendar_days
+    warmup_observation_count = detector.recommended_export_warmup_observation_count()
+    warmup_history_start = _resolve_environment_export_history_start(
+        loader=loader,
+        requested_start=start_ts,
+        config=config,
+        warmup_observation_count=warmup_observation_count,
+        refresh=refresh,
     )
-    if not refresh:
-        local_history_start = _local_env_history_start(loader, config)
-        if local_history_start is not None and local_history_start <= start_ts:
-            history_start = max(history_start, local_history_start)
+    ensure_credit_spread_coverage = getattr(
+        loader,
+        "ensure_credit_spread_reference_coverage",
+        None,
+    )
+    if callable(ensure_credit_spread_coverage):
+        ensure_credit_spread_coverage(
+            warmup_history_start,
+            end_ts,
+            refresh=refresh,
+        )
+
+    history_start = resolve_environment_report_history_start(
+        loader=loader,
+        requested_start=start_ts,
+        config=config,
+        refresh=refresh,
+    )
     trading_calendar = loader.get_trading_calendar(
         history_start,
         end_ts,
@@ -105,34 +172,73 @@ def build_environment_score_report(
         history_start,
         end_ts,
     )
-    scores, summary = detector.compute_aligned(macro_daily, trading_calendar)
-    window_scores = scores.loc[
-        scores["trade_date"].between(start_ts, end_ts)
-    ].copy()
-    if window_scores.empty:
-        raise ValueError("Requested window has no environment scores to export.")
+    computation, summary = detector.compute_aligned_with_warmup(
+        macro_daily,
+        trading_calendar,
+    )
 
     history_start_used = _max_timestamp(
         _safe_min_timestamp(trading_calendar, "calendar_date"),
         _safe_min_timestamp(macro_daily, "trade_date"),
     )
-    expected_trade_days = trading_calendar.loc[
+    requested_trade_days = trading_calendar.loc[
         (trading_calendar["is_open"].astype("Int64") == 1)
         & trading_calendar["calendar_date"].between(start_ts, end_ts),
         "calendar_date",
     ]
-    notes = _build_history_notes(
+    first_ready_trade_date = _resolve_environment_warmup_first_ready_date(
+        score_dates=computation.scores["trade_date"],
+        requested_start=start_ts,
+        requested_end=end_ts,
+        warmup_observation_count=warmup_observation_count,
+    )
+    trend_first_ready_date = _first_ready_trade_date(
+        computation.readiness,
+        "trend_ready",
+    )
+    effective_start = max(start_ts, first_ready_trade_date)
+    window_scores = computation.scores.loc[
+        computation.scores["trade_date"].between(effective_start, end_ts)
+    ].copy()
+    if window_scores.empty:
+        raise ValueError("Requested window has no export-ready environment scores to export.")
+    trend_ready_by_date = computation.readiness.set_index("trade_date")["trend_ready"]
+    trend_ready_mask = (
+        pd.to_datetime(window_scores["trade_date"], errors="coerce")
+        .map(trend_ready_by_date)
+        .fillna(False)
+        .astype(bool)
+    )
+    window_scores.loc[~trend_ready_mask, "trend_strength"] = float("nan")
+
+    warmup_trade_days_excluded = _count_trade_days_in_range(
+        requested_trade_days,
+        start_ts,
+        effective_start,
+    )
+    history_notes = _build_history_notes(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         context="环境打分",
-    ) + _build_window_coverage_notes(
+    )
+    warmup_notes = _build_environment_warmup_notes(
+        requested_start=start_ts,
+        requested_end=end_ts,
+        first_ready_trade_date=first_ready_trade_date,
+        warmup_trade_days_excluded=warmup_trade_days_excluded,
+    )
+    expected_trade_days = requested_trade_days.loc[
+        pd.to_datetime(requested_trade_days, errors="coerce").between(effective_start, end_ts)
+    ]
+    coverage_notes = _build_window_coverage_notes(
         expected_dates=expected_trade_days,
         actual_dates=window_scores["trade_date"],
         context="环境打分",
     )
-    data_quality_status = "警告" if notes else "正常"
-    if data_quality_status == "警告":
-        notes = notes + (_data_quality_warning_note("环境打分"),)
+    data_quality_status = resolve_data_quality_status(bool(history_notes or coverage_notes))
+    notes = history_notes + warmup_notes + coverage_notes
+    if data_quality_status != DATA_QUALITY_STATUS_OK:
+        notes = notes + (build_data_quality_warning_note("环境打分"),)
     return EnvironmentScoreReport(
         scores=window_scores.reset_index(drop=True),
         summary=summary,
@@ -140,6 +246,9 @@ def build_environment_score_report(
         requested_end=end_ts,
         history_start_requested=history_start,
         history_start_used=history_start_used,
+        warmup_first_ready_date=first_ready_trade_date,
+        trend_first_ready_date=trend_first_ready_date,
+        warmup_trade_days_excluded=warmup_trade_days_excluded,
         refresh_requested=bool(refresh),
         data_quality_status=data_quality_status,
         notes=notes,
@@ -176,30 +285,38 @@ def build_factor_score_report(
             f"{config.exports.factor_max_codes_per_run}"
         )
 
-    history_start = start_ts - pd.Timedelta(
-        days=_recommended_factor_history_buffer_calendar_days(config)
+    history_start = resolve_factor_report_history_start(
+        loader=loader,
+        requested_start=start_ts,
+        config=config,
+        codes=normalized_codes,
+        refresh=refresh,
     )
-    if not refresh:
-        local_history_start = _local_factor_history_start(loader, normalized_codes)
-        if local_history_start is not None and local_history_start <= start_ts:
-            history_start = max(history_start, local_history_start)
     cb_daily = loader.get_cb_daily_cross_section(
         history_start,
         end_ts,
         refresh=refresh,
+        columns=list(engine.HISTORY_COLUMNS),
+        aggregate_profile="factor_history_v1",
     )
     cb_basic = loader.get_cb_basic()
     cb_rate = None
-    if not cb_daily.empty and cb_daily["ytm"].isna().any() and hasattr(loader, "get_cb_rate"):
-        universe_codes = (
-            cb_daily.loc[cb_daily["trade_date"].between(start_ts, end_ts), "cb_code"]
-            .dropna()
-            .astype(str)
-            .drop_duplicates()
-            .tolist()
-        )
-        if universe_codes:
-            cb_rate = loader.get_cb_rate(universe_codes, refresh=refresh)
+    ytm_window_mask = (
+        cb_daily["trade_date"].between(start_ts, end_ts)
+        if not cb_daily.empty
+        else pd.Series(dtype="bool")
+    )
+    missing_ytm_codes = (
+        cb_daily.loc[ytm_window_mask & cb_daily["ytm"].isna(), "cb_code"]
+        .dropna()
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+        if not cb_daily.empty
+        else []
+    )
+    if missing_ytm_codes and hasattr(loader, "get_cb_rate"):
+        cb_rate = loader.get_cb_rate(missing_ytm_codes, refresh=refresh)
     cb_call = loader.get_cb_call(
         history_start,
         end_ts,
@@ -221,6 +338,7 @@ def build_factor_score_report(
     if not trade_days:
         raise ValueError("Requested window has no open trading days.")
 
+    estimated_ytm_updates: list[pd.DataFrame] = []
     diagnostics = engine.compute_panel_with_diagnostics(
         trade_days=trade_days,
         cb_daily=cb_daily,
@@ -228,46 +346,50 @@ def build_factor_score_report(
         cb_call=cb_call,
         cb_rate=cb_rate,
         requested_codes=normalized_codes,
+        on_ytm_estimated=estimated_ytm_updates.append,
     )
+    if (
+        estimated_ytm_updates
+        and hasattr(loader, "persist_cb_daily_cross_section_derived_fields")
+    ):
+        loader.persist_cb_daily_cross_section_derived_fields(
+            pd.concat(estimated_ytm_updates, ignore_index=True),
+            columns=("ytm",),
+        )
     diagnostics = engine.append_weighted_total_score(
         diagnostics,
         factor_weights=config.model.base_weights,
     )
+    diagnostics = diagnostics.loc[
+        :,
+        _ordered_existing_columns(
+            diagnostics,
+            FACTOR_DIAGNOSTIC_EXPORT_COLUMNS,
+        ),
+    ].copy()
     scores = diagnostics.loc[
         :,
-        [
-            "trade_date",
-            "cb_code",
-            "baseline_total_score",
-            "value_score",
-            "carry_score",
-            "structure_score",
-            "trend_score",
-            "stability_score",
-            "eligible",
-            "exclude_reason",
-            "close",
-            "premium_rate",
-            "ytm",
-            "remain_size",
-            "amount_mean_20",
-        ],
+        _ordered_existing_columns(
+            diagnostics,
+            FACTOR_SCORE_DISPLAY_COLUMNS,
+        ),
     ].copy()
-    history_start_used = _safe_min_timestamp(cb_daily, "trade_date")
+    history_start_used = _safe_min_timestamp(
+        cb_daily,
+        "trade_date",
+    ) or pd.Timestamp("1970-01-01")
     history_notes = _build_history_notes(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         context="因子打分",
     )
     diagnostic_notes = _build_factor_diagnostic_notes(diagnostics, normalized_codes)
-    data_quality_status = (
-        "警告"
-        if history_notes or _has_factor_data_completeness_issue(diagnostics)
-        else "正常"
+    data_quality_status = resolve_data_quality_status(
+        bool(history_notes or _has_factor_data_completeness_issue(diagnostics))
     )
     notes = history_notes + diagnostic_notes
-    if data_quality_status == "警告":
-        notes = notes + (_data_quality_warning_note("因子打分"),)
+    if data_quality_status != DATA_QUALITY_STATUS_OK:
+        notes = notes + (build_data_quality_warning_note("因子打分"),)
     return FactorScoreReport(
         scores=scores.reset_index(drop=True),
         diagnostics=diagnostics.reset_index(drop=True),
@@ -305,7 +427,7 @@ def write_environment_score_xlsx(
         _build_environment_summary_row("fetch_policy", report.fetch_policy),
         _build_environment_summary_row(
             "refresh_requested",
-            "是" if report.refresh_requested else "否",
+            yes_no_label(report.refresh_requested),
         ),
         _build_environment_summary_row("data_quality_status", report.data_quality_status),
         _build_environment_summary_row(
@@ -323,6 +445,26 @@ def write_environment_score_xlsx(
         _build_environment_summary_row(
             "history_start_used",
             report.history_start_used.strftime("%Y-%m-%d"),
+        ),
+        _build_environment_summary_row(
+            "warmup_first_ready_date",
+            (
+                report.warmup_first_ready_date.strftime("%Y-%m-%d")
+                if report.warmup_first_ready_date is not None
+                else ""
+            ),
+        ),
+        _build_environment_summary_row(
+            "trend_first_ready_date",
+            (
+                report.trend_first_ready_date.strftime("%Y-%m-%d")
+                if report.trend_first_ready_date is not None
+                else ""
+            ),
+        ),
+        _build_environment_summary_row(
+            "warmup_trade_days_excluded",
+            report.warmup_trade_days_excluded,
         ),
         _build_environment_summary_row(
             "total_calendar_days",
@@ -382,7 +524,7 @@ def write_factor_score_xlsx(
         _build_factor_summary_row("fetch_policy", report.fetch_policy),
         _build_factor_summary_row(
             "refresh_requested",
-            "是" if report.refresh_requested else "否",
+            yes_no_label(report.refresh_requested),
         ),
         _build_factor_summary_row("data_quality_status", report.data_quality_status),
         _build_factor_summary_row(
@@ -406,6 +548,22 @@ def write_factor_score_xlsx(
         _build_factor_summary_row(
             "factor_max_codes_per_run",
             config.exports.factor_max_codes_per_run,
+        ),
+        _build_factor_summary_row(
+            "score_sheet_role",
+            "每个代码一个精简展示 sheet，保留总分、五因子分、可用性结果和关键观测字段。",
+        ),
+        _build_factor_summary_row(
+            "diagnostics_sheet_role",
+            "公共 diagnostics sheet，集中保留原始因子 raw 值、过滤原因和布尔诊断列。",
+        ),
+        _build_factor_summary_row(
+            "score_sheet_columns",
+            ",".join(report.scores.columns),
+        ),
+        _build_factor_summary_row(
+            "diagnostics_sheet_columns",
+            ",".join(report.diagnostics.columns),
         ),
     ]
     summary_rows.extend(
@@ -537,52 +695,11 @@ def _make_unique_excel_sheet_name(
         counter += 1
 
 
-def _safe_min_timestamp(frame: pd.DataFrame, column: str) -> pd.Timestamp:
-    if frame.empty or column not in frame.columns:
-        return pd.Timestamp("1970-01-01")
-    values = pd.to_datetime(frame[column], errors="coerce").dropna()
-    if values.empty:
-        return pd.Timestamp("1970-01-01")
-    return pd.Timestamp(values.min()).normalize()
-
-
-def _max_timestamp(*values: pd.Timestamp) -> pd.Timestamp:
-    cleaned = [pd.Timestamp(value).normalize() for value in values if value is not None]
-    if not cleaned:
-        return pd.Timestamp("1970-01-01")
-    return max(cleaned)
-
-
-def _recommended_factor_history_buffer_calendar_days(
-    config: StrategyParameters,
-) -> int:
-    required_trading_days = max(
-        int(config.factor.momentum_window) + 1,
-        int(config.factor.volatility_window) + 1,
-        int(config.factor.amount_mean_window) + 1,
-        int(config.factor.min_listing_days) + 1,
-    )
-    derived_calendar_days = max(
-        60,
-        int(math.ceil(required_trading_days * 2.0)),
-    )
-    return min(
-        int(config.exports.factor_history_buffer_calendar_days),
-        derived_calendar_days,
-    )
-
-
-def _build_history_notes(
-    history_start_requested: pd.Timestamp,
-    history_start_used: pd.Timestamp,
-    context: str,
-) -> tuple[str, ...]:
-    if history_start_used <= history_start_requested:
-        return ()
-    return (
-        f"{context}预热窗口未完全覆盖，当前报告基于本地可用缓存或当前可得历史数据生成。",
-        f"预热起点请求为 {history_start_requested.strftime('%Y-%m-%d')}，实际使用起点为 {history_start_used.strftime('%Y-%m-%d')}。",
-    )
+def _ordered_existing_columns(
+    frame: pd.DataFrame,
+    preferred_columns: Iterable[str],
+) -> list[str]:
+    return [column for column in preferred_columns if column in frame.columns]
 
 
 def _build_window_coverage_notes(
@@ -615,6 +732,107 @@ def _build_window_coverage_notes(
     return tuple(notes)
 
 
+def _resolve_environment_warmup_first_ready_date(
+    score_dates: pd.Series | list[object],
+    requested_start: pd.Timestamp,
+    requested_end: pd.Timestamp,
+    warmup_observation_count: int,
+) -> pd.Timestamp:
+    observation_dates = pd.to_datetime(score_dates, errors="coerce")
+    observation_dates = (
+        pd.Series(observation_dates)
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .reset_index(drop=True)
+    )
+    if observation_dates.empty:
+        raise ValueError("Requested window has no environment scores to export.")
+
+    requested_dates = observation_dates.loc[
+        observation_dates.between(requested_start, requested_end)
+    ].reset_index(drop=True)
+    if requested_dates.empty:
+        raise ValueError("Requested window has no environment scores to export.")
+
+    required_prior_observations = max(0, int(warmup_observation_count))
+    available_prior_observations = int((observation_dates < requested_start).sum())
+    shortage = max(0, required_prior_observations - available_prior_observations)
+    if shortage <= 0:
+        return pd.Timestamp(requested_dates.iloc[0]).normalize()
+
+    requested_onward = observation_dates.loc[
+        observation_dates.ge(requested_start)
+    ].reset_index(drop=True)
+    first_ready_candidate = (
+        pd.Timestamp(requested_onward.iloc[shortage]).normalize()
+        if len(requested_onward) > shortage
+        else None
+    )
+    if first_ready_candidate is None or first_ready_candidate > requested_end:
+        first_ready_label = (
+            first_ready_candidate.strftime("%Y-%m-%d")
+            if first_ready_candidate is not None
+            else "unknown"
+        )
+        raise ValueError(
+            "Requested window remains entirely inside the environment warm-up interval; "
+            f"first export-ready trade date is {first_ready_label}."
+        )
+    return first_ready_candidate
+
+
+def _first_ready_trade_date(
+    readiness: pd.DataFrame,
+    column: str,
+) -> pd.Timestamp | None:
+    if readiness.empty or column not in readiness.columns:
+        return None
+    ready_dates = pd.to_datetime(
+        readiness.loc[readiness[column].fillna(False).astype(bool), "trade_date"],
+        errors="coerce",
+    ).dropna()
+    if ready_dates.empty:
+        return None
+    return pd.Timestamp(ready_dates.iloc[0]).normalize()
+
+
+def _build_environment_warmup_notes(
+    requested_start: pd.Timestamp,
+    requested_end: pd.Timestamp,
+    first_ready_trade_date: pd.Timestamp | None,
+    warmup_trade_days_excluded: int,
+) -> tuple[str, ...]:
+    if first_ready_trade_date is None:
+        return ()
+    first_ready = pd.Timestamp(first_ready_trade_date).normalize()
+    if first_ready <= requested_start or warmup_trade_days_excluded <= 0:
+        return ()
+    warmup_end = min(requested_end, first_ready - pd.Timedelta(days=1))
+    return (
+        "环境打分已自动识别预热区间，预热期默认值不会纳入正式导出结果。",
+        (
+            f"已跳过 {warmup_trade_days_excluded} 个请求窗口内交易日，"
+            f"预热区间截至 {warmup_end.strftime('%Y-%m-%d')}，"
+            f"首个正式环境得分交易日为 {first_ready.strftime('%Y-%m-%d')}。"
+        ),
+    )
+
+
+def _count_trade_days_in_range(
+    trade_days: pd.Series | list[object],
+    start_ts: pd.Timestamp,
+    end_exclusive_ts: pd.Timestamp,
+) -> int:
+    if start_ts >= end_exclusive_ts:
+        return 0
+    days = pd.to_datetime(trade_days, errors="coerce")
+    days = pd.Series(days).dropna()
+    if days.empty:
+        return 0
+    return int(days.between(start_ts, end_exclusive_ts - pd.Timedelta(days=1)).sum())
+
+
 def _build_environment_summary_row(item: str, value: object) -> dict[str, object]:
     return {
         "item": item,
@@ -634,6 +852,9 @@ def _environment_summary_comment(item: str) -> str:
         "requested_end": "用户本次输入的结束日期。",
         "history_start_requested": "按预热窗口规则向前回溯后，请求参与计算的预热起点。",
         "history_start_used": "本次运行实际可用并参与环境计算的历史起点。",
+        "warmup_first_ready_date": "按导出预热观察数规则自动识别出的首个正式环境得分交易日；早于该日期的请求窗口交易日视为预热期。",
+        "trend_first_ready_date": "本次环境计算中 trend 指标首次 ready 的交易日；早于该日期的 trend_strength 会在导出中留空。",
+        "warmup_trade_days_excluded": "本次请求窗口内因落在环境预热区间而被自动排除的交易日数量。",
         "total_calendar_days": "参与本次环境对齐与计算的交易日历总天数，包含预热区间。",
         "kept_days": "完成环境对齐后，所有必需指标都有效并被保留的交易日数量。",
         "dropped_days": "完成环境对齐后，因必需指标缺失或超过填充上限而被剔除的交易日数量。",
@@ -680,6 +901,14 @@ def _factor_summary_comment(item: str) -> str:
         "code_count": "本次导出的可转债代码数量。",
         "factor_max_codes_per_run": "当前配置允许单次因子打分导出的最大代码数量。",
     }
+    fixed_comments.update(
+        {
+            "score_sheet_role": "说明每个代码 sheet 承担用户展示职责，应优先保持字段精简且稳定。",
+            "diagnostics_sheet_role": "说明 diagnostics sheet 承担排查职责，应集中保留 raw 因子和过滤细节。",
+            "score_sheet_columns": "本次每个代码展示 sheet 的固定列集合，便于后续 strategy 模块按稳定 schema 接入。",
+            "diagnostics_sheet_columns": "本次 diagnostics sheet 的固定列集合，便于排查原始因子值和过滤原因。",
+        }
+    )
     if item in fixed_comments:
         return fixed_comments[item]
 
@@ -745,73 +974,3 @@ def _has_factor_data_completeness_issue(diagnostics: pd.DataFrame) -> bool:
             return True
     return False
 
-
-def _data_quality_warning_note(context: str) -> str:
-    return (
-        f"{context}当前存在数据完整性风险，计算结果可能偏离真实可投资信号，"
-        "请勿直接据此做投资判断。"
-    )
-
-
-def _local_env_history_start(
-    loader: DataLoader,
-    config: StrategyParameters,
-) -> pd.Timestamp | None:
-    if not hasattr(loader, "cache_store") or not hasattr(loader, "source_name"):
-        return None
-    frames = [
-        loader.cache_store.load_calendar(loader.source_name, config.data.calendar_exchange),
-        loader.cache_store.load_time_series(loader.source_name, "index_daily", "000300.SH"),
-        loader.cache_store.load_time_series(loader.source_name, "index_daily", "H11001.CSI"),
-        loader.cache_store.load_time_series(
-            loader.source_name,
-            "yield_curve",
-            f"{config.data.treasury_curve_code}__{config.data.treasury_curve_type}__{config.data.treasury_curve_term:g}",
-        ),
-        loader.cache_store.load_time_series(loader.source_name, "cb_equal_weight", "ALL"),
-        loader.cache_store.load_reference_frame("macro", "credit_spread"),
-    ]
-    if any(frame is None or frame.empty for frame in frames):
-        return None
-    candidates = [
-        _safe_min_timestamp(frames[0], "calendar_date"),
-        _safe_min_timestamp(frames[1], "trade_date"),
-        _safe_min_timestamp(frames[2], "trade_date"),
-        _safe_min_timestamp(frames[3], "trade_date"),
-        _safe_min_timestamp(frames[4], "trade_date"),
-        _safe_min_timestamp(frames[5], "trade_date"),
-    ]
-    return max(candidates)
-
-
-def _local_factor_history_start(
-    loader: DataLoader,
-    codes: list[str],
-) -> pd.Timestamp | None:
-    if not hasattr(loader, "cache_store") or not hasattr(loader, "source_name"):
-        return None
-    cross_section_dir = (
-        loader.cache_store.base_dir
-        / loader.source_name
-        / "time_series"
-        / "cb_daily_cross_section"
-    )
-    if cross_section_dir.exists():
-        trade_days = [
-            pd.Timestamp(path.stem).normalize()
-            for path in cross_section_dir.glob("*.csv")
-            if path.stem.isdigit() and len(path.stem) == 8
-        ]
-        if trade_days:
-            return min(trade_days)
-    if not codes:
-        return None
-    frames = [
-        loader.cache_store.load_time_series(loader.source_name, "cb_daily", code)
-        for code in codes
-    ]
-    available_frames = [frame for frame in frames if frame is not None and not frame.empty]
-    if not available_frames:
-        return None
-    starts = [_safe_min_timestamp(frame, "trade_date") for frame in available_frames]
-    return min(starts)

@@ -16,7 +16,7 @@ from strategy_config import DataParameters, load_strategy_parameters
 
 from .exceptions import DataSourceUnavailable
 from .schema import DataSchema
-from .utils import normalize_date
+from .utils import merge_frames, normalize_date
 
 
 CHINABOND_QUERY_YZ_URL = "https://valuation.chinabond.com.cn/cbweb-mn/yc/queryYz"
@@ -179,19 +179,29 @@ class CreditSpreadReferenceUpdater:
                         raise DataSourceUnavailable(
                             f"Fetched credit_spread reference is empty from {source.name}."
                         )
-                    self._save_frame(fresh)
+                    existing = self.load_existing()
+                    merged = DataSchema.standardize(
+                        "macro_daily",
+                        merge_frames(
+                            existing,
+                            fresh,
+                            key_columns=("indicator_code", "trade_date"),
+                            sort_columns=("indicator_code", "trade_date"),
+                        ),
+                    )
+                    self._save_frame(merged)
                     self._save_metadata(
                         {
                             "mode": "fresh_primary" if index == 0 else "fresh_backup",
-                            "coverage_start": fresh["trade_date"].min().strftime("%Y-%m-%d"),
-                            "coverage_end": fresh["trade_date"].max().strftime("%Y-%m-%d"),
-                            "rows": int(len(fresh)),
-                            "source_table": str(fresh["source_table"].iloc[-1]),
+                            "coverage_start": merged["trade_date"].min().strftime("%Y-%m-%d"),
+                            "coverage_end": merged["trade_date"].max().strftime("%Y-%m-%d"),
+                            "rows": int(len(merged)),
+                            "source_table": str(merged["source_table"].iloc[-1]),
                             "active_source": source.name,
                             "registered_backups": [item.name for item in self.backup_sources],
                         }
                     )
-                    return fresh
+                    return merged
                 except Exception as source_exc:
                     errors.append(f"{source.name}: {source_exc}")
             raise DataSourceUnavailable("; ".join(errors) or "No credit_spread source succeeded.")

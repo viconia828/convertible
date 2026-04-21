@@ -6,6 +6,7 @@ from datetime import date
 
 import pandas as pd
 
+from .cache import DataCacheService
 from .cache_store import CacheStore
 from .exceptions import DataSourceUnavailable
 from .schema import DataSchema
@@ -19,13 +20,20 @@ class TradingCalendar:
     def __init__(
         self,
         client: TushareClient,
-        cache_store: CacheStore,
+        cache_store: CacheStore | None = None,
+        cache_service: DataCacheService | None = None,
         source_name: str = "tushare",
         default_exchange: str = "SSE",
     ) -> None:
+        if cache_service is None and cache_store is None:
+            raise ValueError("cache_store or cache_service is required")
         self.client = client
-        self.cache_store = cache_store
         self.source_name = source_name
+        self.cache_store = cache_store or cache_service.cache_store
+        self.cache_service = cache_service or DataCacheService(
+            cache_store=self.cache_store,
+            source_name=self.source_name,
+        )
         self.default_exchange = default_exchange.upper()
 
     def get_calendar(
@@ -41,16 +49,21 @@ class TradingCalendar:
         start_ts = normalize_date(start_date)
         end_ts = normalize_date(end_date)
 
-        cached = None if refresh else self.cache_store.load_calendar(
-            self.source_name, exchange_code
-        )
         cached = (
-            DataSchema.standardize("trading_calendar", cached)
-            if cached is not None
-            else None
+            None
+            if refresh
+            else self.cache_service.load_calendar(
+                exchange_code,
+                standardized_name="trading_calendar",
+            )
         )
 
-        if not refresh and self._covers(cached, start_ts, end_ts):
+        if not refresh and self.cache_service.covers_time_series(
+            cached,
+            start_ts,
+            end_ts,
+            "calendar_date",
+        ):
             return self._slice(cached, start_ts, end_ts)
 
         try:
@@ -73,11 +86,16 @@ class TradingCalendar:
                     sort_columns=DataSchema.get_schema("trading_calendar").sort_columns,
                 ),
             )
-            self.cache_store.save_calendar(self.source_name, exchange_code, merged)
+            self.cache_service.save_calendar(exchange_code, merged)
             return self._slice(merged, start_ts, end_ts)
         except Exception as exc:  # noqa: BLE001
             fallback = self._load_fallback(exchange_code)
-            if fallback is not None and self._covers(fallback, start_ts, end_ts):
+            if fallback is not None and self.cache_service.covers_time_series(
+                fallback,
+                start_ts,
+                end_ts,
+                "calendar_date",
+            ):
                 return self._slice(fallback, start_ts, end_ts)
             if cached is not None and not cached.empty:
                 return self._slice(cached, start_ts, end_ts)
@@ -139,16 +157,6 @@ class TradingCalendar:
             return None
         return open_days.iloc[0].date()
 
-    def _covers(
-        self, frame: pd.DataFrame | None, start_ts: pd.Timestamp, end_ts: pd.Timestamp
-    ) -> bool:
-        if frame is None or frame.empty:
-            return False
-        calendar_dates = frame["calendar_date"].dropna()
-        if calendar_dates.empty:
-            return False
-        return bool(calendar_dates.min() <= start_ts and calendar_dates.max() >= end_ts)
-
     def _slice(
         self, frame: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp
     ) -> pd.DataFrame:
@@ -158,7 +166,8 @@ class TradingCalendar:
         return frame.loc[mask].reset_index(drop=True)
 
     def _load_fallback(self, exchange_code: str) -> pd.DataFrame | None:
-        reference = self.cache_store.load_reference_frame("trading_calendar", exchange_code)
-        if reference is None:
-            return None
-        return DataSchema.standardize("trading_calendar", reference)
+        return self.cache_service.load_reference_frame(
+            "trading_calendar",
+            exchange_code,
+            standardized_name="trading_calendar",
+        )

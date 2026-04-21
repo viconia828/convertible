@@ -95,6 +95,43 @@ class CreditSpreadReferenceUpdaterTests(unittest.TestCase):
         self.assertEqual(status.active_source, "manual_backup")
         self.assertEqual(status.source_table, "manual_backup_import")
 
+    def test_refresh_merges_with_existing_snapshot_instead_of_overwriting(self) -> None:
+        case_dir = make_case_dir("credit_spread_merge_existing")
+
+        updater = CreditSpreadReferenceUpdater(
+            reference_path=case_dir / "credit_spread.csv",
+            metadata_path=case_dir / "credit_spread.meta.json",
+            fetcher=lambda start_ts, end_ts: pd.DataFrame(
+                {
+                    "trade_date": pd.to_datetime(["2026-04-03", "2026-04-04"]),
+                    "value": [0.93, 0.94],
+                    "indicator_code": ["credit_spread"] * 2,
+                    "source_table": ["chinabond_queryYz_10y_AA_minus_treasury"] * 2,
+                }
+            ),
+        )
+        pd.DataFrame(
+            {
+                "trade_date": pd.to_datetime(["2026-04-01", "2026-04-02"]),
+                "value": [0.91, 0.92],
+                "indicator_code": ["credit_spread"] * 2,
+                "source_table": ["local_snapshot"] * 2,
+            }
+        ).to_csv(case_dir / "credit_spread.csv", index=False, encoding="utf-8-sig")
+
+        frame = updater.refresh("2026-04-03", "2026-04-04")
+
+        self.assertEqual(
+            list(frame["trade_date"]),
+            [
+                pd.Timestamp("2026-04-01"),
+                pd.Timestamp("2026-04-02"),
+                pd.Timestamp("2026-04-03"),
+                pd.Timestamp("2026-04-04"),
+            ],
+        )
+        self.assertEqual(len(frame), 4)
+
     def test_refresh_falls_back_to_existing_snapshot(self) -> None:
         case_dir = make_case_dir("credit_spread_fallback")
 

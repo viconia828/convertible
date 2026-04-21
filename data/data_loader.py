@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 from strategy_config import DataParameters, StrategyParameters, load_strategy_parameters
 
+from .cache import DataCacheService
 from .cache_store import CacheStore
 from .credit_spread_reference import (
     CreditSpreadReferenceSource,
@@ -28,8 +28,11 @@ class DataLoader:
 
     CB_DAILY_CROSS_SECTION_MAX_WORKERS = 4
     CB_DAILY_CROSS_SECTION_PARALLEL_THRESHOLD = 8
+    CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD = 16
+    CB_DAILY_CROSS_SECTION_AGGREGATE_MIN_DAYS = 8
     CODE_SERIES_MAX_WORKERS = 4
     CODE_SERIES_PARALLEL_THRESHOLD = 4
+    CB_RATE_BATCH_CACHE_THRESHOLD = 16
 
     def __init__(
         self,
@@ -45,6 +48,10 @@ class DataLoader:
         default_cache_dir = Path(__file__).resolve().parent / "cache"
         self.source_name = source_name or self.data_params.source_name
         self.cache_store = CacheStore(cache_dir or default_cache_dir)
+        self.cache_service = DataCacheService(
+            cache_store=self.cache_store,
+            source_name=self.source_name,
+        )
         self.client = client or TushareClient(
             token=token,
             data_params=self.data_params,
@@ -52,6 +59,7 @@ class DataLoader:
         self.calendar = TradingCalendar(
             client=self.client,
             cache_store=self.cache_store,
+            cache_service=self.cache_service,
             source_name=self.source_name,
         )
 
@@ -78,15 +86,24 @@ class DataLoader:
     ) -> pd.DataFrame:
         """Load convertible-bond basic information with fixed/mutable split cache."""
 
-        fixed = None if refresh_fixed else self.cache_store.load_static_frame(
-            self.source_name, "cb_basic", "fixed"
+        fixed = (
+            None
+            if refresh_fixed
+            else self.cache_service.load_static_frame(
+                "cb_basic",
+                "fixed",
+                standardized_name="cb_basic",
+            )
         )
-        mutable = None if refresh_mutable else self.cache_store.load_static_frame(
-            self.source_name, "cb_basic", "mutable"
+        mutable = (
+            None
+            if refresh_mutable
+            else self.cache_service.load_static_frame(
+                "cb_basic",
+                "mutable",
+                standardized_name="cb_basic",
+            )
         )
-
-        fixed = DataSchema.standardize("cb_basic", fixed) if fixed is not None else None
-        mutable = DataSchema.standardize("cb_basic", mutable) if mutable is not None else None
 
         if fixed is not None and mutable is not None and not fixed.empty:
             return self._merge_cb_basic_parts(fixed, mutable)
@@ -97,12 +114,8 @@ class DataLoader:
         )
         standardized = DataSchema.standardize("cb_basic", raw)
         parts = DataSchema.split_by_mutability("cb_basic", standardized)
-        self.cache_store.save_static_frame(
-            self.source_name, "cb_basic", "fixed", parts["fixed"]
-        )
-        self.cache_store.save_static_frame(
-            self.source_name, "cb_basic", "mutable", parts["mutable"]
-        )
+        self.cache_service.save_static_frame("cb_basic", "fixed", parts["fixed"])
+        self.cache_service.save_static_frame("cb_basic", "mutable", parts["mutable"])
         return standardized
 
     def get_cb_daily(
@@ -135,32 +148,89 @@ class DataLoader:
         start_date: object,
         end_date: object,
         refresh: bool = False,
+        columns: list[str] | tuple[str, ...] | None = None,
+        aggregate_profile: str | None = None,
     ) -> pd.DataFrame:
         """Load whole-market convertible-bond daily cross sections by trade date."""
 
         trade_days = self.calendar.get_open_days(start_date, end_date)
         schema = DataSchema.get_schema("cb_daily")
+        projected_columns = self._normalize_projected_columns("cb_daily", columns)
         if not trade_days:
-            return DataSchema.empty_frame("cb_daily")
+            return self._project_frame_columns(
+                DataSchema.empty_frame("cb_daily"),
+                projected_columns,
+            )
 
         frames: list[pd.DataFrame] = []
         cached_frames_by_day: dict[str, pd.DataFrame] = {}
         fallback_frames_by_day: dict[str, pd.DataFrame | None] = {}
         missing_trade_days: list[str] = []
+        trade_day_strs = [
+            pd.Timestamp(trade_day).strftime("%Y%m%d") for trade_day in trade_days
+        ]
+        use_request_panel_cache = bool(
+            not refresh and aggregate_profile == "factor_history_v1"
+        )
+        if use_request_panel_cache:
+            cached_panel = self.cache_service.load_request_panel(
+                dataset_name="cb_daily_cross_section",
+                standardized_name="cb_daily",
+                profile=aggregate_profile,
+                trade_day_strs=trade_day_strs,
+                columns=projected_columns,
+            )
+            if cached_panel is not None:
+                return cached_panel
+        aggregate_frames, aggregate_covered_days, pending_aggregate_months = (
+            self._load_cb_daily_cross_section_aggregate_months(
+                trade_day_strs=trade_day_strs,
+                projected_columns=projected_columns,
+                aggregate_profile=aggregate_profile,
+                refresh=refresh,
+            )
+        )
+        frames.extend(aggregate_frames)
+        remaining_trade_day_strs = [
+            trade_day_str
+            for trade_day_str in trade_day_strs
+            if trade_day_str not in aggregate_covered_days
+        ]
+        resolved_frames_by_day: dict[str, pd.DataFrame] = {}
 
-        for trade_day in trade_days:
-            trade_day_str = pd.Timestamp(trade_day).strftime("%Y%m%d")
-            cached = None if refresh else self.cache_store.load_time_series(
-                self.source_name, "cb_daily_cross_section", trade_day_str
+        if (
+            not refresh
+            and len(remaining_trade_day_strs)
+            >= self.CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD
+        ):
+            cached_frames_by_day, missing_trade_days = self.cache_service.load_grouped_time_series(
+                dataset_name="cb_daily_cross_section",
+                cache_keys=remaining_trade_day_strs,
+                standardized_name="cb_daily",
+                group_column="trade_date",
+                group_as_trade_date_key=True,
+                columns=projected_columns,
             )
-            cached = (
-                DataSchema.standardize("cb_daily", cached) if cached is not None else None
-            )
-            if refresh or cached is None or cached.empty:
-                missing_trade_days.append(trade_day_str)
-                fallback_frames_by_day[trade_day_str] = cached
-            else:
-                cached_frames_by_day[trade_day_str] = cached
+            fallback_frames_by_day = {
+                trade_day_str: None for trade_day_str in missing_trade_days
+            }
+        else:
+            for trade_day_str in remaining_trade_day_strs:
+                cached = (
+                    None
+                    if refresh
+                    else self.cache_service.load_time_series(
+                        "cb_daily_cross_section",
+                        trade_day_str,
+                        standardized_name="cb_daily",
+                        columns=projected_columns,
+                    )
+                )
+                if refresh or cached is None or cached.empty:
+                    missing_trade_days.append(trade_day_str)
+                    fallback_frames_by_day[trade_day_str] = cached
+                else:
+                    cached_frames_by_day[trade_day_str] = cached
 
         fetched_frames_by_day: dict[str, pd.DataFrame] = {}
         if missing_trade_days and not getattr(
@@ -171,8 +241,7 @@ class DataLoader:
                 trade_day_strs=missing_trade_days,
             )
 
-        for trade_day in trade_days:
-            trade_day_str = pd.Timestamp(trade_day).strftime("%Y%m%d")
+        for trade_day_str in remaining_trade_day_strs:
             merged = cached_frames_by_day.get(trade_day_str)
             if merged is None:
                 merged = fetched_frames_by_day.get(trade_day_str)
@@ -183,11 +252,34 @@ class DataLoader:
                     if fallback is not None and not fallback.empty
                     else DataSchema.empty_frame("cb_daily")
                 )
-            frames.append(merged)
+            projected = self._project_frame_columns(merged, projected_columns)
+            resolved_frames_by_day[trade_day_str] = projected
+            frames.append(projected)
+
+        if aggregate_profile and pending_aggregate_months:
+            self._materialize_cb_daily_cross_section_aggregate_months(
+                aggregate_profile=aggregate_profile,
+                projected_columns=projected_columns,
+                pending_months=pending_aggregate_months,
+                resolved_frames_by_day=resolved_frames_by_day,
+            )
 
         if not frames:
-            return DataSchema.empty_frame("cb_daily")
-        return DataSchema.standardize("cb_daily", pd.concat(frames, ignore_index=True))
+            return self._project_frame_columns(
+                DataSchema.empty_frame("cb_daily"),
+                projected_columns,
+            )
+        final = pd.concat(frames, ignore_index=True)
+        if use_request_panel_cache:
+            self.cache_service.save_request_panel(
+                dataset_name="cb_daily_cross_section",
+                standardized_name="cb_daily",
+                profile=aggregate_profile,
+                trade_day_strs=trade_day_strs,
+                frame=final,
+                columns=projected_columns,
+            )
+        return final
 
     def get_cb_rate(
         self,
@@ -198,21 +290,35 @@ class DataLoader:
 
         schema = DataSchema.get_schema("cb_rate")
         frames: list[pd.DataFrame] = []
-        codes_list = ensure_list(codes)
+        codes_list = list(dict.fromkeys(ensure_list(codes)))
         cached_by_code: dict[str, pd.DataFrame] = {}
         fallback_by_code: dict[str, pd.DataFrame | None] = {}
         missing_codes: list[str] = []
 
-        for code in codes_list:
-            cached = None if refresh else self.cache_store.load_time_series(
-                self.source_name, "cb_rate", code
+        if not refresh and len(codes_list) >= self.CB_RATE_BATCH_CACHE_THRESHOLD:
+            cached_by_code, missing_codes = self.cache_service.load_grouped_time_series(
+                dataset_name="cb_rate",
+                cache_keys=codes_list,
+                standardized_name="cb_rate",
+                group_column="cb_code",
             )
-            cached = DataSchema.standardize("cb_rate", cached) if cached is not None else None
-            if refresh or cached is None or cached.empty:
-                missing_codes.append(code)
-                fallback_by_code[code] = cached
-            else:
-                cached_by_code[code] = cached
+            fallback_by_code = {code: None for code in missing_codes}
+        else:
+            for code in codes_list:
+                cached = (
+                    None
+                    if refresh
+                    else self.cache_service.load_time_series(
+                        "cb_rate",
+                        code,
+                        standardized_name="cb_rate",
+                    )
+                )
+                if refresh or cached is None or cached.empty:
+                    missing_codes.append(code)
+                    fallback_by_code[code] = cached
+                else:
+                    cached_by_code[code] = cached
 
         fetched_by_code: dict[str, pd.DataFrame] = {}
         if missing_codes and not getattr(self.client, "is_temporarily_unavailable", False):
@@ -238,6 +344,25 @@ class DataLoader:
             return DataSchema.empty_frame("cb_rate")
         return DataSchema.standardize("cb_rate", pd.concat(frames, ignore_index=True))
 
+    def persist_cb_daily_cross_section_derived_fields(
+        self,
+        updates: pd.DataFrame,
+        columns: tuple[str, ...] = ("ytm",),
+        base_frame: pd.DataFrame | None = None,
+    ) -> None:
+        """Fill derived fields back into cached cb_daily_cross_section files."""
+
+        self.cache_service.writeback_derived_fields(
+            dataset_name="cb_daily_cross_section",
+            updates=updates,
+            columns=columns,
+            base_frame=base_frame,
+            key_columns=("cb_code", "trade_date"),
+            date_column="trade_date",
+            standardized_name="cb_daily",
+            group_as_trade_date_key=True,
+        )
+
     def get_cb_call(
         self,
         start_date: object,
@@ -252,13 +377,18 @@ class DataLoader:
         end_ts = normalize_date(end_date)
         cache_key = "ALL"
 
-        cached = None if refresh else self.cache_store.load_time_series(
-            self.source_name, "cb_call", cache_key
+        cached = (
+            None
+            if refresh
+            else self.cache_service.load_time_series(
+                "cb_call",
+                cache_key,
+                standardized_name="cb_call",
+            )
         )
-        cached = DataSchema.standardize("cb_call", cached) if cached is not None else None
-        coverage = self._load_time_series_coverage("cb_call", cache_key)
+        coverage = self.cache_service.load_time_series_coverage("cb_call", cache_key)
 
-        if refresh or not self._covers_sparse_range(coverage, start_ts, end_ts):
+        if refresh or not self.cache_service.covers_sparse_range(coverage, start_ts, end_ts):
             if getattr(self.client, "is_temporarily_unavailable", False):
                 merged = (
                     cached
@@ -285,10 +415,12 @@ class DataLoader:
                             sort_columns=schema.sort_columns,
                         ),
                     )
-                    self.cache_store.save_time_series(
-                        self.source_name, "cb_call", cache_key, merged
+                    self.cache_service.save_time_series(
+                        "cb_call",
+                        cache_key,
+                        merged,
                     )
-                    self._save_time_series_coverage(
+                    self.cache_service.save_time_series_coverage(
                         "cb_call",
                         cache_key,
                         start_ts if coverage is None else min(start_ts, coverage["start"]),
@@ -370,7 +502,11 @@ class DataLoader:
             if direct is not None:
                 frames.append(direct)
                 continue
-            reference = self.cache_store.load_reference_frame("macro", indicator)
+            reference = (
+                self.ensure_credit_spread_reference_coverage(start_ts, end_ts)
+                if indicator == "credit_spread"
+                else self.cache_service.load_reference_frame("macro", indicator)
+            )
             if reference is None:
                 if indicator == "credit_spread":
                     raise DataSourceUnavailable(
@@ -395,6 +531,39 @@ class DataLoader:
         if not frames:
             return DataSchema.empty_frame("macro_daily")
         return DataSchema.standardize("macro_daily", pd.concat(frames, ignore_index=True))
+
+    def ensure_credit_spread_reference_coverage(
+        self,
+        start_date: object,
+        end_date: object,
+        refresh: bool = False,
+        use_existing_on_failure: bool = True,
+    ) -> pd.DataFrame | None:
+        """Ensure the local credit-spread reference covers the requested date range."""
+
+        start_ts = normalize_date(start_date)
+        end_ts = normalize_date(end_date)
+        cached = (
+            None
+            if refresh
+            else self.cache_service.load_reference_frame(
+                "macro",
+                "credit_spread",
+                standardized_name="macro_daily",
+            )
+        )
+        if not refresh and self.cache_service.covers_time_series(
+            cached,
+            start_ts,
+            end_ts,
+            "trade_date",
+        ):
+            return cached
+        return self.refresh_credit_spread_reference(
+            start_ts,
+            end_ts,
+            use_existing_on_failure=use_existing_on_failure,
+        )
 
     def refresh_credit_spread_reference(
         self,
@@ -440,14 +609,22 @@ class DataLoader:
         end_ts = normalize_date(end_date)
         cache_key = f"{curve_code}__{curve_type}__{curve_term:g}"
 
-        cached = None if refresh else self.cache_store.load_time_series(
-            self.source_name, "yield_curve", cache_key
-        )
         cached = (
-            DataSchema.standardize("yield_curve", cached) if cached is not None else None
+            None
+            if refresh
+            else self.cache_service.load_time_series(
+                "yield_curve",
+                cache_key,
+                standardized_name="yield_curve",
+            )
         )
 
-        if refresh or not self._covers_time_series(cached, start_ts, end_ts, "trade_date"):
+        if refresh or not self.cache_service.covers_time_series(
+            cached,
+            start_ts,
+            end_ts,
+            "trade_date",
+        ):
             if getattr(self.client, "is_temporarily_unavailable", False):
                 merged = (
                     cached
@@ -481,8 +658,10 @@ class DataLoader:
                             sort_columns=schema.sort_columns,
                         ),
                     )
-                    self.cache_store.save_time_series(
-                        self.source_name, "yield_curve", cache_key, merged
+                    self.cache_service.save_time_series(
+                        "yield_curve",
+                        cache_key,
+                        merged,
                     )
                 except Exception:  # noqa: BLE001
                     merged = (
@@ -520,11 +699,21 @@ class DataLoader:
         missing_codes: list[str] = []
 
         for code in codes_list:
-            cached = None if refresh else self.cache_store.load_time_series(
-                self.source_name, dataset_name, code
+            cached = (
+                None
+                if refresh
+                else self.cache_service.load_time_series(
+                    dataset_name,
+                    code,
+                    standardized_name=dataset_name,
+                )
             )
-            cached = DataSchema.standardize(dataset_name, cached) if cached is not None else None
-            if refresh or not self._covers_time_series(cached, start_ts, end_ts, "trade_date"):
+            if refresh or not self.cache_service.covers_time_series(
+                cached,
+                start_ts,
+                end_ts,
+                "trade_date",
+            ):
                 missing_codes.append(code)
                 fallback_by_code[code] = cached
             else:
@@ -681,9 +870,7 @@ class DataLoader:
                 sort_columns=schema.sort_columns,
             ),
         )
-        self.cache_store.save_time_series(
-            self.source_name, dataset_name, code, merged
-        )
+        self.cache_service.save_time_series(dataset_name, code, merged)
         return merged
 
     def _fetch_cb_rate_codes(
@@ -741,9 +928,7 @@ class DataLoader:
             fields=schema.source_fields,
         )
         merged = DataSchema.standardize("cb_rate", fetched)
-        self.cache_store.save_time_series(
-            self.source_name, "cb_rate", code, merged
-        )
+        self.cache_service.save_time_series("cb_rate", code, merged)
         return merged
 
     def _fetch_cb_daily_cross_sections(
@@ -808,13 +993,130 @@ class DataLoader:
             fields=schema.source_fields,
         )
         merged = DataSchema.standardize("cb_daily", fetched)
-        self.cache_store.save_time_series(
-            self.source_name,
-            "cb_daily_cross_section",
-            trade_day_str,
-            merged,
-        )
+        self.cache_service.save_time_series("cb_daily_cross_section", trade_day_str, merged)
         return merged
+
+    def _project_frame_columns(
+        self,
+        frame: pd.DataFrame,
+        columns: list[str] | tuple[str, ...] | None,
+    ) -> pd.DataFrame:
+        if columns is None:
+            return frame
+        selected = [column for column in columns if column in frame.columns]
+        return frame.loc[:, selected].copy()
+
+    def _normalize_projected_columns(
+        self,
+        dataset_name: str,
+        columns: list[str] | tuple[str, ...] | None,
+    ) -> list[str] | tuple[str, ...] | None:
+        if columns is None:
+            return None
+        schema = DataSchema.get_schema(dataset_name)
+        merged = [str(column) for column in columns]
+        merged.extend(schema.key_columns)
+        return list(dict.fromkeys(merged))
+
+    def _load_cb_daily_cross_section_aggregate_months(
+        self,
+        trade_day_strs: list[str],
+        projected_columns: list[str] | tuple[str, ...] | None,
+        aggregate_profile: str | None,
+        refresh: bool,
+    ) -> tuple[list[pd.DataFrame], set[str], dict[str, list[str]]]:
+        if refresh or aggregate_profile is None:
+            return [], set(), {}
+
+        grouped_days = self._group_trade_day_strs_by_month(trade_day_strs)
+        aggregate_frames: list[pd.DataFrame] = []
+        covered_trade_days: set[str] = set()
+        pending_months: dict[str, list[str]] = {}
+
+        for month_key, month_days in grouped_days.items():
+            metadata = self.cache_service.load_time_series_aggregate_metadata(
+                dataset_name="cb_daily_cross_section",
+                profile=aggregate_profile,
+                partition_key=month_key,
+            )
+            if self.cache_service.covers_aggregate_trade_days(metadata, month_days):
+                aggregate = self.cache_service.load_time_series_aggregate(
+                    dataset_name="cb_daily_cross_section",
+                    profile=aggregate_profile,
+                    partition_key=month_key,
+                    standardized_name="cb_daily",
+                    columns=projected_columns,
+                )
+                if aggregate is not None:
+                    filtered = self._filter_frame_to_trade_day_keys(aggregate, month_days)
+                    if not filtered.empty:
+                        aggregate_frames.append(filtered)
+                    covered_trade_days.update(month_days)
+                    continue
+            if len(month_days) >= self.CB_DAILY_CROSS_SECTION_AGGREGATE_MIN_DAYS:
+                pending_months[month_key] = month_days
+
+        return aggregate_frames, covered_trade_days, pending_months
+
+    def _materialize_cb_daily_cross_section_aggregate_months(
+        self,
+        aggregate_profile: str,
+        projected_columns: list[str] | tuple[str, ...] | None,
+        pending_months: dict[str, list[str]],
+        resolved_frames_by_day: dict[str, pd.DataFrame],
+    ) -> None:
+        if projected_columns is None:
+            return
+
+        for month_key, month_days in pending_months.items():
+            if any(day not in resolved_frames_by_day for day in month_days):
+                continue
+            month_frames = [resolved_frames_by_day[day] for day in month_days]
+            if month_frames:
+                month_frame = pd.concat(month_frames, ignore_index=True)
+            else:
+                month_frame = self._project_frame_columns(
+                    DataSchema.empty_frame("cb_daily"),
+                    projected_columns,
+                )
+            self.cache_service.save_time_series_aggregate(
+                dataset_name="cb_daily_cross_section",
+                profile=aggregate_profile,
+                partition_key=month_key,
+                frame=month_frame,
+                standardized_name="cb_daily",
+            )
+            self.cache_service.save_time_series_aggregate_metadata(
+                dataset_name="cb_daily_cross_section",
+                profile=aggregate_profile,
+                partition_key=month_key,
+                payload={
+                    "covered_trade_days": list(month_days),
+                    "projection_columns": list(projected_columns),
+                },
+            )
+
+    def _group_trade_day_strs_by_month(
+        self,
+        trade_day_strs: list[str],
+    ) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for trade_day_str in trade_day_strs:
+            grouped.setdefault(trade_day_str[:6], []).append(trade_day_str)
+        return grouped
+
+    def _filter_frame_to_trade_day_keys(
+        self,
+        frame: pd.DataFrame,
+        trade_day_strs: list[str],
+    ) -> pd.DataFrame:
+        if frame.empty or "trade_date" not in frame.columns:
+            return frame.iloc[0:0].copy()
+        requested = set(trade_day_strs)
+        trade_day_keys = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime(
+            "%Y%m%d"
+        )
+        return frame.loc[trade_day_keys.isin(requested)].reset_index(drop=True)
 
     def _should_parallel_fetch_cb_daily_cross_sections(self, missing_days: int) -> bool:
         return bool(
@@ -830,6 +1132,22 @@ class DataLoader:
             and getattr(self.client, "supports_parallel_requests", False)
         )
 
+    def _load_cached_grouped_time_series(
+        self,
+        dataset_name: str,
+        cache_keys: list[str],
+        standardized_name: str,
+        group_column: str,
+        group_as_trade_date_key: bool = False,
+    ) -> tuple[dict[str, pd.DataFrame], list[str]]:
+        return self.cache_service.load_grouped_time_series(
+            dataset_name=dataset_name,
+            cache_keys=cache_keys,
+            standardized_name=standardized_name,
+            group_column=group_column,
+            group_as_trade_date_key=group_as_trade_date_key,
+        )
+
     def _covers_time_series(
         self,
         frame: pd.DataFrame | None,
@@ -837,12 +1155,12 @@ class DataLoader:
         end_ts: pd.Timestamp,
         date_column: str,
     ) -> bool:
-        if frame is None or frame.empty or date_column not in frame.columns:
-            return False
-        values = frame[date_column].dropna()
-        if values.empty:
-            return False
-        return bool(values.min() <= start_ts and values.max() >= end_ts)
+        return self.cache_service.covers_time_series(
+            frame=frame,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            date_column=date_column,
+        )
 
     def _covers_expected_dates(
         self,
@@ -851,30 +1169,12 @@ class DataLoader:
         date_column: str,
         indicator_code: str | None = None,
     ) -> bool:
-        if not expected_dates:
-            return True
-        if frame is None or frame.empty or date_column not in frame.columns:
-            return False
-
-        working = frame
-        if indicator_code is not None and "indicator_code" in working.columns:
-            working = working.loc[working["indicator_code"] == indicator_code]
-        if working.empty:
-            return False
-
-        actual_dates = (
-            pd.to_datetime(working[date_column], errors="coerce")
-            .dropna()
-            .dt.normalize()
-            .unique()
+        return self.cache_service.covers_expected_dates(
+            frame=frame,
+            expected_dates=expected_dates,
+            date_column=date_column,
+            indicator_code=indicator_code,
         )
-        if len(actual_dates) == 0:
-            return False
-
-        expected_index = pd.DatetimeIndex(pd.to_datetime(expected_dates, errors="coerce")).dropna()
-        if expected_index.empty:
-            return True
-        return bool(expected_index.normalize().isin(actual_dates).all())
 
     def _merge_cb_basic_parts(
         self, fixed: pd.DataFrame, mutable: pd.DataFrame
@@ -903,21 +1203,12 @@ class DataLoader:
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
     ) -> bool:
-        if coverage is None:
-            return False
-        return bool(coverage["start"] <= start_ts and coverage["end"] >= end_ts)
+        return self.cache_service.covers_sparse_range(coverage, start_ts, end_ts)
 
     def _load_time_series_coverage(
         self, dataset_name: str, cache_key: str
     ) -> dict[str, pd.Timestamp] | None:
-        metadata_path = self._time_series_coverage_path(dataset_name, cache_key)
-        if not metadata_path.exists():
-            return None
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        return {
-            "start": pd.Timestamp(payload["start"]).normalize(),
-            "end": pd.Timestamp(payload["end"]).normalize(),
-        }
+        return self.cache_service.load_time_series_coverage(dataset_name, cache_key)
 
     def _save_time_series_coverage(
         self,
@@ -926,36 +1217,23 @@ class DataLoader:
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
     ) -> None:
-        metadata_path = self._time_series_coverage_path(dataset_name, cache_key)
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "start": start_ts.strftime("%Y-%m-%d"),
-                    "end": end_ts.strftime("%Y-%m-%d"),
-                },
-                ensure_ascii=True,
-                indent=2,
-            ),
-            encoding="utf-8",
+        self.cache_service.save_time_series_coverage(
+            dataset_name=dataset_name,
+            cache_key=cache_key,
+            start_ts=start_ts,
+            end_ts=end_ts,
         )
 
     def _time_series_coverage_path(self, dataset_name: str, cache_key: str) -> Path:
-        return (
-            self.cache_store.base_dir
-            / self.source_name
-            / "time_series"
-            / dataset_name
-            / f"{cache_key}.coverage.json"
-        )
+        return self.cache_service.time_series_coverage_path(dataset_name, cache_key)
 
     def _credit_spread_reference_updater(
         self,
         primary_source: CreditSpreadReferenceSource | None = None,
         backup_sources: list[CreditSpreadReferenceSource] | None = None,
     ) -> CreditSpreadReferenceUpdater:
-        reference_path = self.cache_store.reference_dir / "macro" / "credit_spread.csv"
-        metadata_path = self.cache_store.reference_dir / "macro" / "credit_spread.meta.json"
+        reference_path = self.cache_service.reference_frame_path("macro", "credit_spread")
+        metadata_path = self.cache_service.reference_metadata_path("macro", "credit_spread")
         return CreditSpreadReferenceUpdater(
             reference_path=reference_path,
             metadata_path=metadata_path,
@@ -1033,15 +1311,18 @@ class DataLoader:
         start_ts = normalize_date(start_date)
         end_ts = normalize_date(end_date)
         cache_key = "ALL"
-        cached = None if refresh else self.cache_store.load_time_series(
-            self.source_name, "cb_equal_weight", cache_key
-        )
         cached = (
-            DataSchema.standardize("macro_daily", cached) if cached is not None else None
+            None
+            if refresh
+            else self.cache_service.load_time_series(
+                "cb_equal_weight",
+                cache_key,
+                standardized_name="macro_daily",
+            )
         )
         expected_trade_days = self.calendar.get_open_days(start_ts, end_ts)
 
-        if refresh or not self._covers_expected_dates(
+        if refresh or not self.cache_service.covers_expected_dates(
             cached,
             expected_trade_days,
             "trade_date",
@@ -1058,9 +1339,7 @@ class DataLoader:
                     sort_columns=("indicator_code", "trade_date"),
                 ),
             )
-            self.cache_store.save_time_series(
-                self.source_name, "cb_equal_weight", cache_key, merged
-            )
+            self.cache_service.save_time_series("cb_equal_weight", cache_key, merged)
         else:
             merged = cached
 
