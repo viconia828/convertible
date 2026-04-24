@@ -157,7 +157,7 @@ annualization_days = 252
 zscore_ddof = 0
 
 [strategy]
-# strategy 主链路构造 snapshot 时使用的统一历史缓冲区间（自然日）
+# strategy 主链路构造 snapshot 时使用的额外历史缓冲区间（自然日）；设为 0 表示按环境/因子窗口自动推导
 history_buffer_calendar_days = 550
 
 [strategy.portfolio]

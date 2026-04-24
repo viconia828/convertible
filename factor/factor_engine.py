@@ -10,12 +10,13 @@ import numpy as np
 import pandas as pd
 
 from data.derived_metrics import estimate_ytm_series
-from strategy_config import FactorParameters, load_strategy_parameters
+from config.strategy_config import FactorParameters, load_strategy_parameters
 
 
 class FactorEngine:
     """Compute factor scores and apply basic universe filtering."""
 
+    NEUTRAL_PERCENTILE_SCORE = 0.5
     SCORE_COLUMNS = (
         "value_score",
         "carry_score",
@@ -75,6 +76,7 @@ class FactorEngine:
         "eligible",
         "exclude_reason",
         "has_required_fields",
+        "uses_trend_neutral_score",
         "is_recently_listed",
         "is_size_ok",
         "is_amount_ok",
@@ -265,7 +267,8 @@ class FactorEngine:
         total = pd.Series(0.0, index=result.index, dtype="float64")
         for factor, column in self.SCORE_COLUMN_BY_FACTOR.items():
             weight = float(factor_weights[factor])
-            total = total + result[column].astype("float64") * weight
+            score_values = pd.to_numeric(result[column], errors="coerce")
+            total = total + score_values * weight
         result[column_name] = total
         if "eligible" in result.columns:
             result.loc[~result["eligible"], column_name] = pd.NA
@@ -439,9 +442,18 @@ class FactorEngine:
         )
         scored["trend_raw"] = scored["momentum_60"]
         scored["stability_raw"] = scored["volatility_60"]
-        scored["has_required_fields"] = scored[
-            ["premium_rate", "ytm", "momentum_60", "volatility_60"]
+        required_without_trend = scored[
+            ["premium_rate", "ytm", "volatility_60"]
         ].notna().all(axis=1)
+        scored["uses_trend_neutral_score"] = (
+            required_without_trend
+            & scored["momentum_60"].isna()
+            & ~scored["is_recently_listed"].fillna(False)
+            & scored["listing_obs"].le(self.params.momentum_window).fillna(False)
+        )
+        scored["has_required_fields"] = required_without_trend & (
+            scored["momentum_60"].notna() | scored["uses_trend_neutral_score"]
+        )
         scored["eligible"] = self._eligible_mask(scored)
 
         for column in self.SCORE_COLUMNS:
@@ -475,9 +487,10 @@ class FactorEngine:
         scored.loc[eligible_index, "structure_score"] = self._percentile_rank(
             eligible["structure_raw"]
         ).to_numpy()
-        scored.loc[eligible_index, "trend_score"] = self._percentile_rank(
-            eligible["trend_raw"]
-        ).to_numpy()
+        trend_scores = self._percentile_rank(eligible["trend_raw"])
+        neutral_trend_mask = eligible["uses_trend_neutral_score"].fillna(False)
+        trend_scores.loc[neutral_trend_mask] = self.NEUTRAL_PERCENTILE_SCORE
+        scored.loc[eligible_index, "trend_score"] = trend_scores.to_numpy()
         scored.loc[eligible_index, "stability_score"] = (
             1.0 - self._percentile_rank(eligible["stability_raw"])
         ).to_numpy()
@@ -643,6 +656,7 @@ class FactorEngine:
         frame["eligible"] = False
         frame["exclude_reason"] = "missing_daily_history"
         frame["has_required_fields"] = False
+        frame["uses_trend_neutral_score"] = False
         frame["is_recently_listed"] = False
         frame["is_size_ok"] = False
         frame["is_amount_ok"] = False

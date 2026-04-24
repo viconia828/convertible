@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from env.macro_alignment import MacroAlignmentSummary
-from reporting_semantics import (
+from shared.reporting_semantics import (
     DATA_QUALITY_STATUS_OK,
     DATA_QUALITY_STATUS_WARNING,
     build_data_quality_warning_note,

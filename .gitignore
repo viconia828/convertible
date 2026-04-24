@@ -32,6 +32,9 @@ Thumbs.db
 ~$*.docx
 ~$*.pptx
 
-data/cache/
+data/cache/*
+!data/cache/*.py
+data/cache/__pycache__/
+data/cache/tushare/
 tests/_tmp/
 导出结果/

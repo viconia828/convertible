@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from strategy_config import (
+from config.strategy_config import (
     StrategyPortfolioParameters,
     load_strategy_parameters,
 )

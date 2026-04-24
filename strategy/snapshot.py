@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -31,3 +31,5 @@ class StrategySnapshot:
     refresh_requested: bool = False
     requested_codes: tuple[str, ...] = ()
     data_quality_hints: tuple[str, ...] = ()
+    runtime_snapshot_reused: bool = False
+    cache_diagnostics: dict[str, object] = field(default_factory=dict)

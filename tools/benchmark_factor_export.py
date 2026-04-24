@@ -14,17 +14,17 @@ from pathlib import Path
 
 import pandas as pd
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scoring_exports import (  # noqa: E402
+from config.strategy_config import load_strategy_parameters  # noqa: E402
+from exports.scoring_exports import (  # noqa: E402
     build_factor_score_report,
     write_factor_score_xlsx,
 )
 from data.data_loader import DataLoader  # noqa: E402
-from strategy_config import load_strategy_parameters  # noqa: E402
+from shared.cache_diagnostics import build_cache_diagnostics, diff_cache_stats  # noqa: E402
 
 
 try:  # pragma: no cover - optional dependency
@@ -61,6 +61,9 @@ class BenchmarkResult:
     peak_rss_mb: float
     peak_rss_delta_mb: float
     cache_stats: dict[str, int]
+    cache_observability: dict[str, object]
+    cache_diagnostics: dict[str, object]
+    iteration_cache_diagnostics: list[dict[str, object]]
     output_path: str
 
 
@@ -130,9 +133,11 @@ def main() -> int:
         started = time.perf_counter()
         build_durations: list[float] = []
         write_durations: list[float] = []
+        iteration_cache_diagnostics: list[dict[str, object]] = []
         report = None
         final_output_path = ""
         for iteration in range(repeat):
+            cache_stats_before_iteration = loader.cache_service.stats_snapshot()
             build_started = time.perf_counter()
             report = build_factor_score_report(
                 start_date=args.start_date,
@@ -157,6 +162,18 @@ def main() -> int:
             else:
                 written = built
             write_durations.append(round(written - built, 3))
+            cache_stats_after_iteration = loader.cache_service.stats_snapshot()
+            iteration_cache_diagnostics.append(
+                {
+                    "iteration": iteration + 1,
+                    **build_cache_diagnostics(
+                        diff_cache_stats(
+                            cache_stats_before_iteration,
+                            cache_stats_after_iteration,
+                        )
+                    ),
+                }
+            )
         finished = time.perf_counter()
         if report is None:
             raise RuntimeError("Benchmark did not build any report.")
@@ -199,6 +216,9 @@ def main() -> int:
         peak_rss_mb=round(peak_rss / 1024 / 1024, 1),
         peak_rss_delta_mb=round((peak_rss - rss_before) / 1024 / 1024, 1),
         cache_stats=loader.cache_service.stats_snapshot(),
+        cache_observability=loader.cache_service.observability_snapshot(),
+        cache_diagnostics=build_cache_diagnostics(loader.cache_service.stats_snapshot()),
+        iteration_cache_diagnostics=iteration_cache_diagnostics,
         output_path=final_output_path,
     )
     print(json.dumps(asdict(result), ensure_ascii=False, indent=2))

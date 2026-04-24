@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
-from strategy_config import DataParameters, StrategyParameters, load_strategy_parameters
+
+from config.strategy_config import DataParameters, StrategyParameters, load_strategy_parameters
 
 from .cache import DataCacheService
 from .cache_store import CacheStore
@@ -52,6 +54,7 @@ class DataLoader:
             cache_store=self.cache_store,
             source_name=self.source_name,
         )
+        self._reference_runtime_generation = 0
         self.client = client or TushareClient(
             token=token,
             data_params=self.data_params,
@@ -86,6 +89,7 @@ class DataLoader:
     ) -> pd.DataFrame:
         """Load convertible-bond basic information with fixed/mutable split cache."""
 
+        cache_lookup_started = perf_counter()
         fixed = (
             None
             if refresh_fixed
@@ -104,13 +108,33 @@ class DataLoader:
                 standardized_name="cb_basic",
             )
         )
+        self.cache_service.record_stage_timing(
+            "cache_lookup",
+            perf_counter() - cache_lookup_started,
+            dataset_name="cb_basic",
+        )
 
         if fixed is not None and mutable is not None and not fixed.empty:
+            self.cache_service.record_cache_resolution("hit", "cb_basic")
             return self._merge_cb_basic_parts(fixed, mutable)
 
-        raw = self.client.query(
+        if refresh_fixed or refresh_mutable:
+            self.cache_service.record_cache_resolution("refresh_bypass", "cb_basic")
+        elif any(frame is not None and not frame.empty for frame in (fixed, mutable)):
+            self.cache_service.record_cache_resolution("partial_hit", "cb_basic")
+        else:
+            self.cache_service.record_cache_resolution("miss", "cb_basic")
+
+        remote_fetch_started = perf_counter()
+        raw = self._query_remote(
+            dataset_name="cb_basic",
             api_name=DataSchema.get_schema("cb_basic").api_name or "cb_basic",
             fields=DataSchema.get_schema("cb_basic").source_fields,
+        )
+        self.cache_service.record_stage_timing(
+            "remote_fetch",
+            perf_counter() - remote_fetch_started,
+            dataset_name="cb_basic",
         )
         standardized = DataSchema.standardize("cb_basic", raw)
         parts = DataSchema.split_by_mutability("cb_basic", standardized)
@@ -172,6 +196,7 @@ class DataLoader:
         use_request_panel_cache = bool(
             not refresh and aggregate_profile == "factor_history_v1"
         )
+        request_panel_lookup_started = perf_counter()
         if use_request_panel_cache:
             cached_panel = self.cache_service.load_request_panel(
                 dataset_name="cb_daily_cross_section",
@@ -180,8 +205,27 @@ class DataLoader:
                 trade_day_strs=trade_day_strs,
                 columns=projected_columns,
             )
+            self.cache_service.record_stage_timing(
+                "request_panel_lookup",
+                perf_counter() - request_panel_lookup_started,
+                dataset_name="cb_daily_cross_section",
+                profile=aggregate_profile,
+            )
             if cached_panel is not None:
+                self.cache_service.record_cache_resolution(
+                    "hit",
+                    "cb_daily_cross_section",
+                    profile=aggregate_profile,
+                )
                 return cached_panel
+        else:
+            self.cache_service.record_stage_timing(
+                "request_panel_lookup",
+                perf_counter() - request_panel_lookup_started,
+                dataset_name="cb_daily_cross_section",
+                profile=aggregate_profile,
+            )
+        aggregate_lookup_started = perf_counter()
         aggregate_frames, aggregate_covered_days, pending_aggregate_months = (
             self._load_cb_daily_cross_section_aggregate_months(
                 trade_day_strs=trade_day_strs,
@@ -189,6 +233,12 @@ class DataLoader:
                 aggregate_profile=aggregate_profile,
                 refresh=refresh,
             )
+        )
+        self.cache_service.record_stage_timing(
+            "aggregate_lookup",
+            perf_counter() - aggregate_lookup_started,
+            dataset_name="cb_daily_cross_section",
+            profile=aggregate_profile,
         )
         frames.extend(aggregate_frames)
         remaining_trade_day_strs = [
@@ -198,6 +248,7 @@ class DataLoader:
         ]
         resolved_frames_by_day: dict[str, pd.DataFrame] = {}
 
+        day_cache_lookup_started = perf_counter()
         if (
             not refresh
             and len(remaining_trade_day_strs)
@@ -231,8 +282,23 @@ class DataLoader:
                     fallback_frames_by_day[trade_day_str] = cached
                 else:
                     cached_frames_by_day[trade_day_str] = cached
+        self.cache_service.record_stage_timing(
+            "day_cache_lookup",
+            perf_counter() - day_cache_lookup_started,
+            dataset_name="cb_daily_cross_section",
+            profile=aggregate_profile,
+        )
+        self._record_cache_resolution_from_counts(
+            dataset_name="cb_daily_cross_section",
+            total_count=len(trade_day_strs),
+            cached_count=len(aggregate_covered_days) + len(cached_frames_by_day),
+            missing_count=len(missing_trade_days),
+            refresh=refresh,
+            profile=aggregate_profile,
+        )
 
         fetched_frames_by_day: dict[str, pd.DataFrame] = {}
+        remote_fetch_started = perf_counter()
         if missing_trade_days and not getattr(
             self.client, "is_temporarily_unavailable", False
         ):
@@ -240,6 +306,12 @@ class DataLoader:
                 schema=schema,
                 trade_day_strs=missing_trade_days,
             )
+        self.cache_service.record_stage_timing(
+            "remote_fetch",
+            perf_counter() - remote_fetch_started,
+            dataset_name="cb_daily_cross_section",
+            profile=aggregate_profile,
+        )
 
         for trade_day_str in remaining_trade_day_strs:
             merged = cached_frames_by_day.get(trade_day_str)
@@ -256,6 +328,7 @@ class DataLoader:
             resolved_frames_by_day[trade_day_str] = projected
             frames.append(projected)
 
+        aggregate_materialize_started = perf_counter()
         if aggregate_profile and pending_aggregate_months:
             self._materialize_cb_daily_cross_section_aggregate_months(
                 aggregate_profile=aggregate_profile,
@@ -263,13 +336,26 @@ class DataLoader:
                 pending_months=pending_aggregate_months,
                 resolved_frames_by_day=resolved_frames_by_day,
             )
+        self.cache_service.record_stage_timing(
+            "aggregate_materialize",
+            perf_counter() - aggregate_materialize_started,
+            dataset_name="cb_daily_cross_section",
+            profile=aggregate_profile,
+        )
 
         if not frames:
             return self._project_frame_columns(
                 DataSchema.empty_frame("cb_daily"),
                 projected_columns,
             )
+        result_concat_started = perf_counter()
         final = pd.concat(frames, ignore_index=True)
+        self.cache_service.record_stage_timing(
+            "result_concat",
+            perf_counter() - result_concat_started,
+            dataset_name="cb_daily_cross_section",
+            profile=aggregate_profile,
+        )
         if use_request_panel_cache:
             self.cache_service.save_request_panel(
                 dataset_name="cb_daily_cross_section",
@@ -295,6 +381,7 @@ class DataLoader:
         fallback_by_code: dict[str, pd.DataFrame | None] = {}
         missing_codes: list[str] = []
 
+        cache_lookup_started = perf_counter()
         if not refresh and len(codes_list) >= self.CB_RATE_BATCH_CACHE_THRESHOLD:
             cached_by_code, missing_codes = self.cache_service.load_grouped_time_series(
                 dataset_name="cb_rate",
@@ -319,13 +406,31 @@ class DataLoader:
                     fallback_by_code[code] = cached
                 else:
                     cached_by_code[code] = cached
+        self.cache_service.record_stage_timing(
+            "cache_lookup",
+            perf_counter() - cache_lookup_started,
+            dataset_name="cb_rate",
+        )
+        self._record_cache_resolution_from_counts(
+            dataset_name="cb_rate",
+            total_count=len(codes_list),
+            cached_count=len(cached_by_code),
+            missing_count=len(missing_codes),
+            refresh=refresh,
+        )
 
         fetched_by_code: dict[str, pd.DataFrame] = {}
+        remote_fetch_started = perf_counter()
         if missing_codes and not getattr(self.client, "is_temporarily_unavailable", False):
             fetched_by_code = self._fetch_cb_rate_codes(
                 schema=schema,
                 codes=missing_codes,
             )
+        self.cache_service.record_stage_timing(
+            "remote_fetch",
+            perf_counter() - remote_fetch_started,
+            dataset_name="cb_rate",
+        )
 
         for code in codes_list:
             merged = cached_by_code.get(code)
@@ -342,7 +447,14 @@ class DataLoader:
 
         if not frames:
             return DataSchema.empty_frame("cb_rate")
-        return DataSchema.standardize("cb_rate", pd.concat(frames, ignore_index=True))
+        result_concat_started = perf_counter()
+        final = DataSchema.standardize("cb_rate", pd.concat(frames, ignore_index=True))
+        self.cache_service.record_stage_timing(
+            "result_concat",
+            perf_counter() - result_concat_started,
+            dataset_name="cb_rate",
+        )
+        return final
 
     def persist_cb_daily_cross_section_derived_fields(
         self,
@@ -377,6 +489,7 @@ class DataLoader:
         end_ts = normalize_date(end_date)
         cache_key = "ALL"
 
+        cache_lookup_started = perf_counter()
         cached = (
             None
             if refresh
@@ -386,8 +499,26 @@ class DataLoader:
                 standardized_name="cb_call",
             )
         )
-        coverage = self.cache_service.load_time_series_coverage("cb_call", cache_key)
+        coverage = self.cache_service.load_time_series_coverage(
+            "cb_call",
+            cache_key,
+            standardized_name="cb_call",
+        )
+        self.cache_service.record_stage_timing(
+            "cache_lookup",
+            perf_counter() - cache_lookup_started,
+            dataset_name="cb_call",
+        )
+        if refresh:
+            self.cache_service.record_cache_resolution("refresh_bypass", "cb_call")
+        elif self.cache_service.covers_sparse_range(coverage, start_ts, end_ts):
+            self.cache_service.record_cache_resolution("hit", "cb_call")
+        elif cached is not None and not cached.empty:
+            self.cache_service.record_cache_resolution("partial_hit", "cb_call")
+        else:
+            self.cache_service.record_cache_resolution("miss", "cb_call")
 
+        remote_fetch_started = perf_counter()
         if refresh or not self.cache_service.covers_sparse_range(coverage, start_ts, end_ts):
             if getattr(self.client, "is_temporarily_unavailable", False):
                 merged = (
@@ -397,7 +528,8 @@ class DataLoader:
                 )
             else:
                 try:
-                    fetched = self.client.query(
+                    fetched = self._query_remote(
+                        dataset_name="cb_call",
                         api_name=schema.api_name or "cb_call",
                         params={
                             "start_date": format_tushare_date(start_ts),
@@ -425,6 +557,7 @@ class DataLoader:
                         cache_key,
                         start_ts if coverage is None else min(start_ts, coverage["start"]),
                         end_ts if coverage is None else max(end_ts, coverage["end"]),
+                        standardized_name="cb_call",
                     )
                 except Exception:  # noqa: BLE001
                     merged = (
@@ -434,16 +567,27 @@ class DataLoader:
                     )
         else:
             merged = cached
+        self.cache_service.record_stage_timing(
+            "remote_fetch",
+            perf_counter() - remote_fetch_started,
+            dataset_name="cb_call",
+        )
 
         if merged is None or merged.empty:
             return DataSchema.empty_frame("cb_call")
 
+        result_filter_started = perf_counter()
         filtered = merged.loc[
             merged["announcement_date"].ge(start_ts)
             & merged["announcement_date"].le(end_ts)
         ].copy()
         if codes is not None:
             filtered = filtered.loc[filtered["cb_code"].isin(ensure_list(codes))].copy()
+        self.cache_service.record_stage_timing(
+            "result_filter",
+            perf_counter() - result_filter_started,
+            dataset_name="cb_call",
+        )
         return DataSchema.standardize("cb_call", filtered)
 
     def get_stock_daily(
@@ -579,11 +723,13 @@ class DataLoader:
             primary_source=primary_source,
             backup_sources=backup_sources,
         )
-        return updater.refresh(
+        refreshed = updater.refresh(
             start_date=start_date,
             end_date=end_date,
             use_existing_on_failure=use_existing_on_failure,
         )
+        self._reference_runtime_generation += 1
+        return refreshed
 
     def get_credit_spread_reference_status(
         self,
@@ -592,6 +738,16 @@ class DataLoader:
         """Return local coverage/freshness diagnostics for `credit_spread`."""
 
         return self._credit_spread_reference_updater().status(as_of_date=as_of_date)
+
+    def runtime_dependency_revision(self) -> tuple[int, int]:
+        cache_generation = 0
+        generation = getattr(self.cache_service, "runtime_content_generation", None)
+        if callable(generation):
+            try:
+                cache_generation = int(generation())
+            except Exception:  # noqa: BLE001
+                cache_generation = 0
+        return (cache_generation, int(self._reference_runtime_generation))
 
     def get_yield_curve(
         self,
@@ -609,6 +765,7 @@ class DataLoader:
         end_ts = normalize_date(end_date)
         cache_key = f"{curve_code}__{curve_type}__{curve_term:g}"
 
+        cache_lookup_started = perf_counter()
         cached = (
             None
             if refresh
@@ -618,7 +775,26 @@ class DataLoader:
                 standardized_name="yield_curve",
             )
         )
+        self.cache_service.record_stage_timing(
+            "cache_lookup",
+            perf_counter() - cache_lookup_started,
+            dataset_name="yield_curve",
+        )
+        if refresh:
+            self.cache_service.record_cache_resolution("refresh_bypass", "yield_curve")
+        elif self.cache_service.covers_time_series(
+            cached,
+            start_ts,
+            end_ts,
+            "trade_date",
+        ):
+            self.cache_service.record_cache_resolution("hit", "yield_curve")
+        elif cached is not None and not cached.empty:
+            self.cache_service.record_cache_resolution("partial_hit", "yield_curve")
+        else:
+            self.cache_service.record_cache_resolution("miss", "yield_curve")
 
+        remote_fetch_started = perf_counter()
         if refresh or not self.cache_service.covers_time_series(
             cached,
             start_ts,
@@ -633,7 +809,8 @@ class DataLoader:
                 )
             else:
                 try:
-                    fetched = self.client.query(
+                    fetched = self._query_remote(
+                        dataset_name="yield_curve",
                         api_name=schema.api_name or "yc_cb",
                         params={
                             "ts_code": curve_code,
@@ -671,13 +848,24 @@ class DataLoader:
                     )
         else:
             merged = cached
+        self.cache_service.record_stage_timing(
+            "remote_fetch",
+            perf_counter() - remote_fetch_started,
+            dataset_name="yield_curve",
+        )
 
         if merged is None or merged.empty:
             return DataSchema.empty_frame("yield_curve")
 
+        result_filter_started = perf_counter()
         filtered = merged.loc[
             merged["trade_date"].ge(start_ts) & merged["trade_date"].le(end_ts)
         ].copy()
+        self.cache_service.record_stage_timing(
+            "result_filter",
+            perf_counter() - result_filter_started,
+            dataset_name="yield_curve",
+        )
         return DataSchema.standardize("yield_curve", filtered)
 
     def _get_time_series(
@@ -698,6 +886,7 @@ class DataLoader:
         fallback_by_code: dict[str, pd.DataFrame | None] = {}
         missing_codes: list[str] = []
 
+        cache_lookup_started = perf_counter()
         for code in codes_list:
             cached = (
                 None
@@ -718,8 +907,21 @@ class DataLoader:
                 fallback_by_code[code] = cached
             else:
                 cached_by_code[code] = cached
+        self.cache_service.record_stage_timing(
+            "cache_lookup",
+            perf_counter() - cache_lookup_started,
+            dataset_name=dataset_name,
+        )
+        self._record_cache_resolution_from_counts(
+            dataset_name=dataset_name,
+            total_count=len(codes_list),
+            cached_count=len(cached_by_code),
+            missing_count=len(missing_codes),
+            refresh=refresh,
+        )
 
         fetched_by_code: dict[str, pd.DataFrame] = {}
+        remote_fetch_started = perf_counter()
         if missing_codes and not getattr(self.client, "is_temporarily_unavailable", False):
             fetched_by_code = self._fetch_time_series_codes(
                 dataset_name=dataset_name,
@@ -729,6 +931,11 @@ class DataLoader:
                 end_ts=end_ts,
                 cached_by_code=fallback_by_code,
             )
+        self.cache_service.record_stage_timing(
+            "remote_fetch",
+            perf_counter() - remote_fetch_started,
+            dataset_name=dataset_name,
+        )
 
         for code in codes_list:
             merged = cached_by_code.get(code)
@@ -755,7 +962,14 @@ class DataLoader:
 
         if not frames:
             return DataSchema.empty_frame(dataset_name)
-        return DataSchema.standardize(dataset_name, pd.concat(frames, ignore_index=True))
+        result_concat_started = perf_counter()
+        final = DataSchema.standardize(dataset_name, pd.concat(frames, ignore_index=True))
+        self.cache_service.record_stage_timing(
+            "result_concat",
+            perf_counter() - result_concat_started,
+            dataset_name=dataset_name,
+        )
+        return final
 
     def _fetch_time_series_codes(
         self,
@@ -851,7 +1065,8 @@ class DataLoader:
         end_ts: pd.Timestamp,
         cached: pd.DataFrame | None,
     ) -> pd.DataFrame:
-        fetched = self.client.query(
+        fetched = self._query_remote(
+            dataset_name=dataset_name,
             api_name=schema.api_name or dataset_name,
             params={
                 "ts_code": code,
@@ -922,7 +1137,8 @@ class DataLoader:
         schema,
         code: str,
     ) -> pd.DataFrame:
-        fetched = self.client.query(
+        fetched = self._query_remote(
+            dataset_name="cb_rate",
             api_name=schema.api_name or "cb_rate",
             params={"ts_code": code},
             fields=schema.source_fields,
@@ -987,7 +1203,8 @@ class DataLoader:
         schema,
         trade_day_str: str,
     ) -> pd.DataFrame:
-        fetched = self.client.query(
+        fetched = self._query_remote(
+            dataset_name="cb_daily_cross_section",
             api_name=schema.api_name or "cb_daily",
             params={"trade_date": trade_day_str},
             fields=schema.source_fields,
@@ -1038,8 +1255,12 @@ class DataLoader:
                 dataset_name="cb_daily_cross_section",
                 profile=aggregate_profile,
                 partition_key=month_key,
+                standardized_name="cb_daily",
+                requested_columns=projected_columns,
             )
-            if self.cache_service.covers_aggregate_trade_days(metadata, month_days):
+            if metadata is not None and self.cache_service.covers_aggregate_trade_days(
+                metadata, month_days
+            ):
                 aggregate = self.cache_service.load_time_series_aggregate(
                     dataset_name="cb_daily_cross_section",
                     profile=aggregate_profile,
@@ -1094,6 +1315,7 @@ class DataLoader:
                     "covered_trade_days": list(month_days),
                     "projection_columns": list(projected_columns),
                 },
+                standardized_name="cb_daily",
             )
 
     def _group_trade_day_strs_by_month(
@@ -1130,6 +1352,58 @@ class DataLoader:
             missing_codes >= self.CODE_SERIES_PARALLEL_THRESHOLD
             and self.CODE_SERIES_MAX_WORKERS > 1
             and getattr(self.client, "supports_parallel_requests", False)
+        )
+
+    def _record_cache_resolution_from_counts(
+        self,
+        dataset_name: str,
+        total_count: int,
+        cached_count: int,
+        missing_count: int,
+        refresh: bool,
+        profile: str | None = None,
+    ) -> None:
+        if int(total_count) <= 0:
+            return
+        if refresh:
+            self.cache_service.record_cache_resolution(
+                "refresh_bypass",
+                dataset_name,
+                profile=profile,
+            )
+            return
+        if int(cached_count) <= 0:
+            self.cache_service.record_cache_resolution(
+                "miss",
+                dataset_name,
+                profile=profile,
+            )
+            return
+        if int(missing_count) <= 0 and int(cached_count) >= int(total_count):
+            self.cache_service.record_cache_resolution(
+                "hit",
+                dataset_name,
+                profile=profile,
+            )
+            return
+        self.cache_service.record_cache_resolution(
+            "partial_hit",
+            dataset_name,
+            profile=profile,
+        )
+
+    def _query_remote(
+        self,
+        dataset_name: str,
+        api_name: str,
+        params: dict[str, object] | None = None,
+        fields: str | None = None,
+    ) -> pd.DataFrame:
+        self.cache_service.record_remote_fill(dataset_name)
+        return self.client.query(
+            api_name=api_name,
+            params=params,
+            fields=fields,
         )
 
     def _load_cached_grouped_time_series(
@@ -1311,6 +1585,7 @@ class DataLoader:
         start_ts = normalize_date(start_date)
         end_ts = normalize_date(end_date)
         cache_key = "ALL"
+        cache_lookup_started = perf_counter()
         cached = (
             None
             if refresh
@@ -1321,7 +1596,32 @@ class DataLoader:
             )
         )
         expected_trade_days = self.calendar.get_open_days(start_ts, end_ts)
+        self.cache_service.record_stage_timing(
+            "cache_lookup",
+            perf_counter() - cache_lookup_started,
+            dataset_name="cb_equal_weight",
+        )
+        if refresh:
+            self.cache_service.record_cache_resolution(
+                "refresh_bypass",
+                "cb_equal_weight",
+            )
+        elif self.cache_service.covers_expected_dates(
+            cached,
+            expected_trade_days,
+            "trade_date",
+            indicator_code="cb_equal_weight",
+        ):
+            self.cache_service.record_cache_resolution("hit", "cb_equal_weight")
+        elif cached is not None and not cached.empty:
+            self.cache_service.record_cache_resolution(
+                "partial_hit",
+                "cb_equal_weight",
+            )
+        else:
+            self.cache_service.record_cache_resolution("miss", "cb_equal_weight")
 
+        rebuild_started = perf_counter()
         if refresh or not self.cache_service.covers_expected_dates(
             cached,
             expected_trade_days,
@@ -1342,15 +1642,26 @@ class DataLoader:
             self.cache_service.save_time_series("cb_equal_weight", cache_key, merged)
         else:
             merged = cached
+        self.cache_service.record_stage_timing(
+            "rebuild_from_cross_section",
+            perf_counter() - rebuild_started,
+            dataset_name="cb_equal_weight",
+        )
 
         if merged is None or merged.empty:
             return DataSchema.empty_frame("macro_daily")
 
+        result_filter_started = perf_counter()
         filtered = merged.loc[
             (merged["indicator_code"] == "cb_equal_weight")
             & merged["trade_date"].ge(start_ts)
             & merged["trade_date"].le(end_ts)
         ].copy()
+        self.cache_service.record_stage_timing(
+            "result_filter",
+            perf_counter() - result_filter_started,
+            dataset_name="cb_equal_weight",
+        )
         return DataSchema.standardize("macro_daily", filtered)
 
     def _build_cb_equal_weight_index(self, cross_section: pd.DataFrame) -> pd.DataFrame:

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_STRATEGY_CONFIG_PATH = Path(__file__).resolve().parent / "\u7b56\u7565\u53c2\u6570.txt"
+DEFAULT_STRATEGY_CONFIG_PATH = Path(__file__).resolve().parents[1] / "\u7b56\u7565\u53c2\u6570.txt"
 USER_EDITABLE_TOP_LEVEL_KEYS = frozenset({"env", "factor", "model", "strategy"})
 
 DEFAULT_CONFIG_PAYLOAD: dict[str, Any] = {

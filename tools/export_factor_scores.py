@@ -13,16 +13,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scoring_exports import (  # noqa: E402
+from config.strategy_config import load_strategy_parameters  # noqa: E402
+from exports.scoring_exports import (  # noqa: E402
     build_factor_score_report,
     normalize_cb_codes,
     write_factor_score_xlsx,
 )
-from runtime_hints import (  # noqa: E402
+from tools.runtime_hints import (  # noqa: E402
     build_proxy_startup_hints,
     build_tushare_failure_hints,
 )
-from strategy_config import load_strategy_parameters  # noqa: E402
 
 
 def main() -> int:

@@ -12,7 +12,7 @@ from typing import Protocol
 
 import pandas as pd
 
-from strategy_config import DataParameters, load_strategy_parameters
+from config.strategy_config import DataParameters, load_strategy_parameters
 
 from .exceptions import DataSourceUnavailable
 from .schema import DataSchema

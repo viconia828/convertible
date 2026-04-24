@@ -1,8 +1,8 @@
 {
   "mode": "fallback_local",
   "coverage_start": "2024-08-28",
-  "coverage_end": "2026-04-19",
-  "rows": 405,
+  "coverage_end": "2026-04-22",
+  "rows": 408,
   "source_table": "chinabond_queryYz_10y_AA_minus_treasury",
   "active_source": "local_snapshot",
   "registered_backups": [],

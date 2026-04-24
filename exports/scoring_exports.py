@@ -13,25 +13,24 @@ import pandas as pd
 from data import DataLoader
 from env import EnvironmentDetector, MacroAlignmentSummary
 from factor import FactorEngine
-from history_windows import (
+from config.strategy_config import StrategyParameters, load_strategy_parameters
+from shared.history_windows import (
     build_history_notes as _build_history_notes,
-    inspect_local_env_history_start as _local_env_history_start,
-    inspect_local_factor_history_start as _local_factor_history_start,
     max_available_history_start as _max_timestamp,
     recommended_factor_history_buffer_calendar_days as _recommended_factor_history_buffer_calendar_days,
+    resolve_environment_export_window,
     resolve_environment_report_history_start,
     resolve_environment_warmup_history_start as _resolve_environment_export_history_start,
     resolve_factor_report_history_start,
     safe_min_timestamp as _safe_min_timestamp,
 )
-from reporting_semantics import (
+from shared.reporting_semantics import (
     DATA_QUALITY_STATUS_OK,
     DEFAULT_FETCH_POLICY,
     build_data_quality_warning_note,
     resolve_data_quality_status,
     yes_no_label,
 )
-from strategy_config import StrategyParameters, load_strategy_parameters
 
 FACTOR_SCORE_DISPLAY_COLUMNS = (
     "trade_date",
@@ -186,17 +185,18 @@ def build_environment_score_report(
         & trading_calendar["calendar_date"].between(start_ts, end_ts),
         "calendar_date",
     ]
-    first_ready_trade_date = _resolve_environment_warmup_first_ready_date(
+    window_resolution = resolve_environment_export_window(
         score_dates=computation.scores["trade_date"],
+        readiness=computation.readiness,
+        requested_trade_days=requested_trade_days,
         requested_start=start_ts,
         requested_end=end_ts,
         warmup_observation_count=warmup_observation_count,
+        trend_ready_column="trend_ready",
     )
-    trend_first_ready_date = _first_ready_trade_date(
-        computation.readiness,
-        "trend_ready",
-    )
-    effective_start = max(start_ts, first_ready_trade_date)
+    first_ready_trade_date = window_resolution.warmup_first_ready_date
+    trend_first_ready_date = window_resolution.trend_first_ready_date
+    effective_start = window_resolution.effective_start
     window_scores = computation.scores.loc[
         computation.scores["trade_date"].between(effective_start, end_ts)
     ].copy()
@@ -211,22 +211,17 @@ def build_environment_score_report(
     )
     window_scores.loc[~trend_ready_mask, "trend_strength"] = float("nan")
 
-    warmup_trade_days_excluded = _count_trade_days_in_range(
-        requested_trade_days,
-        start_ts,
-        effective_start,
-    )
+    warmup_trade_days_excluded = window_resolution.warmup_trade_days_excluded
     history_notes = _build_history_notes(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         context="环境打分",
+        trade_days=trading_calendar.loc[
+            trading_calendar["is_open"].astype("Int64") == 1,
+            "calendar_date",
+        ],
     )
-    warmup_notes = _build_environment_warmup_notes(
-        requested_start=start_ts,
-        requested_end=end_ts,
-        first_ready_trade_date=first_ready_trade_date,
-        warmup_trade_days_excluded=warmup_trade_days_excluded,
-    )
+    warmup_notes = window_resolution.notes
     expected_trade_days = requested_trade_days.loc[
         pd.to_datetime(requested_trade_days, errors="coerce").between(effective_start, end_ts)
     ]
@@ -382,6 +377,7 @@ def build_factor_score_report(
         history_start_requested=history_start,
         history_start_used=history_start_used,
         context="因子打分",
+        trade_days=trade_days,
     )
     diagnostic_notes = _build_factor_diagnostic_notes(diagnostics, normalized_codes)
     data_quality_status = resolve_data_quality_status(
@@ -732,107 +728,6 @@ def _build_window_coverage_notes(
     return tuple(notes)
 
 
-def _resolve_environment_warmup_first_ready_date(
-    score_dates: pd.Series | list[object],
-    requested_start: pd.Timestamp,
-    requested_end: pd.Timestamp,
-    warmup_observation_count: int,
-) -> pd.Timestamp:
-    observation_dates = pd.to_datetime(score_dates, errors="coerce")
-    observation_dates = (
-        pd.Series(observation_dates)
-        .dropna()
-        .drop_duplicates()
-        .sort_values()
-        .reset_index(drop=True)
-    )
-    if observation_dates.empty:
-        raise ValueError("Requested window has no environment scores to export.")
-
-    requested_dates = observation_dates.loc[
-        observation_dates.between(requested_start, requested_end)
-    ].reset_index(drop=True)
-    if requested_dates.empty:
-        raise ValueError("Requested window has no environment scores to export.")
-
-    required_prior_observations = max(0, int(warmup_observation_count))
-    available_prior_observations = int((observation_dates < requested_start).sum())
-    shortage = max(0, required_prior_observations - available_prior_observations)
-    if shortage <= 0:
-        return pd.Timestamp(requested_dates.iloc[0]).normalize()
-
-    requested_onward = observation_dates.loc[
-        observation_dates.ge(requested_start)
-    ].reset_index(drop=True)
-    first_ready_candidate = (
-        pd.Timestamp(requested_onward.iloc[shortage]).normalize()
-        if len(requested_onward) > shortage
-        else None
-    )
-    if first_ready_candidate is None or first_ready_candidate > requested_end:
-        first_ready_label = (
-            first_ready_candidate.strftime("%Y-%m-%d")
-            if first_ready_candidate is not None
-            else "unknown"
-        )
-        raise ValueError(
-            "Requested window remains entirely inside the environment warm-up interval; "
-            f"first export-ready trade date is {first_ready_label}."
-        )
-    return first_ready_candidate
-
-
-def _first_ready_trade_date(
-    readiness: pd.DataFrame,
-    column: str,
-) -> pd.Timestamp | None:
-    if readiness.empty or column not in readiness.columns:
-        return None
-    ready_dates = pd.to_datetime(
-        readiness.loc[readiness[column].fillna(False).astype(bool), "trade_date"],
-        errors="coerce",
-    ).dropna()
-    if ready_dates.empty:
-        return None
-    return pd.Timestamp(ready_dates.iloc[0]).normalize()
-
-
-def _build_environment_warmup_notes(
-    requested_start: pd.Timestamp,
-    requested_end: pd.Timestamp,
-    first_ready_trade_date: pd.Timestamp | None,
-    warmup_trade_days_excluded: int,
-) -> tuple[str, ...]:
-    if first_ready_trade_date is None:
-        return ()
-    first_ready = pd.Timestamp(first_ready_trade_date).normalize()
-    if first_ready <= requested_start or warmup_trade_days_excluded <= 0:
-        return ()
-    warmup_end = min(requested_end, first_ready - pd.Timedelta(days=1))
-    return (
-        "环境打分已自动识别预热区间，预热期默认值不会纳入正式导出结果。",
-        (
-            f"已跳过 {warmup_trade_days_excluded} 个请求窗口内交易日，"
-            f"预热区间截至 {warmup_end.strftime('%Y-%m-%d')}，"
-            f"首个正式环境得分交易日为 {first_ready.strftime('%Y-%m-%d')}。"
-        ),
-    )
-
-
-def _count_trade_days_in_range(
-    trade_days: pd.Series | list[object],
-    start_ts: pd.Timestamp,
-    end_exclusive_ts: pd.Timestamp,
-) -> int:
-    if start_ts >= end_exclusive_ts:
-        return 0
-    days = pd.to_datetime(trade_days, errors="coerce")
-    days = pd.Series(days).dropna()
-    if days.empty:
-        return 0
-    return int(days.between(start_ts, end_exclusive_ts - pd.Timedelta(days=1)).sum())
-
-
 def _build_environment_summary_row(item: str, value: object) -> dict[str, object]:
     return {
         "item": item,
@@ -973,4 +868,3 @@ def _has_factor_data_completeness_issue(diagnostics: pd.DataFrame) -> bool:
         if parts & data_issue_reasons:
             return True
     return False
-

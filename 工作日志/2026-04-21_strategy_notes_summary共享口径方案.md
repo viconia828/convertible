@@ -1,4 +1,4 @@
-# 2026-04-21 strategy notes / summary 共享口径方案
+﻿# 2026-04-21 strategy notes / summary 共享口径方案
 
 ## 1. 背景
 
@@ -20,7 +20,7 @@
 
 对应代码主要在：
 
-- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/scoring_exports.py)
+- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/exports/scoring_exports.py)
 
 而 `strategy` 当前更多是零散的：
 
@@ -78,13 +78,13 @@
 
 建议新增：
 
-- [reporting_semantics.py](C:/Users/ai/Desktop/可转债多因子/reporting_semantics.py)
+- [reporting_semantics.py](C:/Users/ai/Desktop/可转债多因子/shared/reporting_semantics.py)
 
 原因：
 
 - 它服务的是导出层和 `strategy` 层的共同语义
 - 不属于单一业务模块
-- 与 [history_windows.py](C:/Users/ai/Desktop/可转债多因子/history_windows.py) 的定位相似，都是跨层共享 helper
+- 与 [history_windows.py](C:/Users/ai/Desktop/可转债多因子/shared/history_windows.py) 的定位相似，都是跨层共享 helper
 
 ## 6. 建议共享的能力
 
@@ -217,3 +217,4 @@
 本轮最稳的做法不是让 `strategy` 去复制导出层的 Excel summary，而是先共享“报告语义”。
 
 这样既能让 `strategy` 预览更像项目现有的正式入口，也能避免导出层和 `strategy` 后续在 warning / status / hint 这些高频文案上继续分叉。
+

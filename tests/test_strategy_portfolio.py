@@ -4,8 +4,8 @@ import unittest
 
 import pandas as pd
 
+from config.strategy_config import StrategyPortfolioParameters
 from strategy.portfolio import PortfolioBuilder
-from strategy_config import StrategyPortfolioParameters
 
 
 class StrategyPortfolioTests(unittest.TestCase):

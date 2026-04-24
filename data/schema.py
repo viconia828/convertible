@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Literal
 
 import pandas as pd
@@ -265,6 +267,31 @@ class DataSchema:
 
         schema = cls.get_schema(dataset_name)
         return pd.DataFrame(columns=schema.all_columns)
+
+    @classmethod
+    def schema_signature(cls, dataset_name: str) -> str:
+        """Return a stable signature for one standardized dataset definition."""
+
+        schema = cls.get_schema(dataset_name)
+        payload = {
+            "name": schema.name,
+            "api_name": schema.api_name,
+            "key_columns": list(schema.key_columns),
+            "sort_columns": list(schema.sort_columns),
+            "date_columns": list(schema.date_columns),
+            "fields": [
+                {
+                    "local_name": field.local_name,
+                    "source_name": field.source_name,
+                    "dtype": field.dtype,
+                    "mutability": field.mutability,
+                }
+                for field in schema.fields
+            ],
+        }
+        return hashlib.sha1(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
 
     @classmethod
     def standardize(cls, dataset_name: str, frame: pd.DataFrame | None) -> pd.DataFrame:

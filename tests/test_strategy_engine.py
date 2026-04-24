@@ -5,12 +5,13 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from config.strategy_config import StrategyPortfolioParameters
+from shared.cache_diagnostics import build_cache_diagnostics
 from env.environment_detector import EnvironmentComputationResult
 from env.macro_alignment import MacroAlignmentSummary
 from strategy.engine import StrategyEngine
 from strategy.portfolio import PortfolioBuilder
 from strategy.snapshot import StrategyHistoryWindow, StrategySnapshot
-from strategy_config import StrategyPortfolioParameters
 
 
 class FakeDetector:
@@ -158,6 +159,34 @@ class FakeFactorEngine:
         return result
 
 
+class RecordingFactorEngine(FakeFactorEngine):
+    def __init__(self) -> None:
+        self.last_cb_daily: pd.DataFrame | None = None
+        self.last_cb_basic: pd.DataFrame | None = None
+        self.last_cb_call: pd.DataFrame | None = None
+        self.last_cb_rate: pd.DataFrame | None = None
+
+    def compute_with_diagnostics(
+        self,
+        as_of_date,
+        cb_daily,
+        cb_basic,
+        cb_call,
+        cb_rate,
+    ) -> pd.DataFrame:
+        self.last_cb_daily = cb_daily.copy()
+        self.last_cb_basic = cb_basic.copy()
+        self.last_cb_call = cb_call.copy()
+        self.last_cb_rate = None if cb_rate is None else cb_rate.copy()
+        return super().compute_with_diagnostics(
+            as_of_date=as_of_date,
+            cb_daily=cb_daily,
+            cb_basic=cb_basic,
+            cb_call=cb_call,
+            cb_rate=cb_rate,
+        )
+
+
 class FakeWeightMapper:
     def compute(self, env):
         return {
@@ -279,6 +308,145 @@ class StrategyEngineTests(unittest.TestCase):
         )
         self.assertTrue(
             any("请勿直接据此做投资判断" in note for note in decision.diagnostics.notes)
+        )
+
+    def test_engine_carries_requested_codes_into_diagnostics(self) -> None:
+        snapshot = self._build_snapshot()
+        snapshot = StrategySnapshot(
+            trade_date=snapshot.trade_date,
+            history_window=snapshot.history_window,
+            trading_calendar=snapshot.trading_calendar,
+            macro_daily=snapshot.macro_daily,
+            cb_daily=snapshot.cb_daily,
+            cb_basic=snapshot.cb_basic,
+            cb_call=snapshot.cb_call,
+            runtime_snapshot_reused=True,
+            requested_codes=("110001.SH", "128123.SZ"),
+            cache_diagnostics=build_cache_diagnostics(
+                {"panel_memory_hit_calls": 2},
+                runtime_snapshot_reused=True,
+            ),
+        )
+        engine = StrategyEngine(
+            detector=FakeDetector(),
+            factor_engine=FakeFactorEngine(),
+            weight_mapper=FakeWeightMapper(),
+            portfolio_builder=PortfolioBuilder(
+                params=StrategyPortfolioParameters(
+                    top_n=2,
+                    min_names=1,
+                    weighting_method="score_proportional",
+                    single_name_max_weight=0.70,
+                    cash_buffer=0.0,
+                )
+            ),
+        )
+
+        decision = engine.run(snapshot)
+
+        self.assertTrue(decision.diagnostics.runtime_snapshot_reused)
+        self.assertEqual(decision.diagnostics.requested_codes, ("110001.SH", "128123.SZ"))
+        self.assertEqual(
+            int(decision.diagnostics.cache_diagnostics["layers"]["request_panel_memory"]["hits"]),
+            2,
+        )
+
+    def test_engine_limits_factor_inputs_to_codes_present_on_trade_date(self) -> None:
+        trade_date = pd.Timestamp("2026-04-20")
+        snapshot = StrategySnapshot(
+            trade_date=trade_date,
+            history_window=StrategyHistoryWindow(
+                trade_date=trade_date,
+                requested_start=pd.Timestamp("2025-10-01"),
+                used_start=pd.Timestamp("2025-10-01"),
+            ),
+            trading_calendar=pd.DataFrame(
+                [{"calendar_date": trade_date, "is_open": 1}]
+            ),
+            macro_daily=pd.DataFrame(),
+            cb_daily=pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "trade_date": pd.Timestamp("2026-04-18"),
+                        "close": 101.0,
+                    },
+                    {
+                        "cb_code": "110002.SH",
+                        "trade_date": pd.Timestamp("2026-04-20"),
+                        "close": 102.0,
+                    },
+                    {
+                        "cb_code": "110002.SH",
+                        "trade_date": pd.Timestamp("2026-04-18"),
+                        "close": 100.0,
+                    },
+                ]
+            ),
+            cb_basic=pd.DataFrame(
+                [
+                    {"cb_code": "110001.SH", "remain_size": 8.0},
+                    {"cb_code": "110002.SH", "remain_size": 7.0},
+                ]
+            ),
+            cb_call=pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "call_type": "强赎",
+                        "call_status": "公告强赎",
+                        "announcement_date": pd.Timestamp("2026-04-01"),
+                        "call_date": pd.NaT,
+                    },
+                    {
+                        "cb_code": "110002.SH",
+                        "call_type": "强赎",
+                        "call_status": "公告强赎",
+                        "announcement_date": pd.Timestamp("2026-04-10"),
+                        "call_date": pd.NaT,
+                    },
+                ]
+            ),
+            cb_rate=pd.DataFrame(
+                [
+                    {"cb_code": "110001.SH", "coupon_rate": 0.5},
+                    {"cb_code": "110002.SH", "coupon_rate": 0.6},
+                ]
+            ),
+        )
+        factor_engine = RecordingFactorEngine()
+        engine = StrategyEngine(
+            detector=FakeDetector(),
+            factor_engine=factor_engine,
+            weight_mapper=FakeWeightMapper(),
+            portfolio_builder=PortfolioBuilder(
+                params=StrategyPortfolioParameters(
+                    top_n=2,
+                    min_names=1,
+                    weighting_method="score_proportional",
+                    single_name_max_weight=0.70,
+                    cash_buffer=0.0,
+                )
+            ),
+        )
+
+        engine.run(snapshot)
+
+        self.assertEqual(
+            set(factor_engine.last_cb_daily["cb_code"]),
+            {"110002.SH"},
+        )
+        self.assertEqual(
+            set(factor_engine.last_cb_basic["cb_code"]),
+            {"110002.SH"},
+        )
+        self.assertEqual(
+            set(factor_engine.last_cb_call["cb_code"]),
+            {"110002.SH"},
+        )
+        self.assertEqual(
+            set(factor_engine.last_cb_rate["cb_code"]),
+            {"110002.SH"},
         )
 
 

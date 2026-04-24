@@ -1,4 +1,4 @@
-# 2026-04-21 cb_daily_cross_section 缓存读取优化方案
+﻿# 2026-04-21 cb_daily_cross_section 缓存读取优化方案
 
 ## 1. 背景
 
@@ -6,7 +6,7 @@
 
 当前因子打分链路会调用：
 
-- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/scoring_exports.py)
+- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/exports/scoring_exports.py)
 - [data/data_loader.py](C:/Users/ai/Desktop/可转债多因子/data/data_loader.py)
 
 去读取请求窗口内所有交易日的 `cb_daily_cross_section` 缓存文件。
@@ -74,7 +74,7 @@
 
 ### 4.4 因子打分链路改为按最小必要列读取
 
-在 [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/scoring_exports.py) 中：
+在 [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/exports/scoring_exports.py) 中：
 
 - 调用 `get_cb_daily_cross_section(...)` 时传入 `FactorEngine.HISTORY_COLUMNS`
 - 只为因子打分链路加载必要列
@@ -136,7 +136,7 @@
 - [data/data_loader.py](C:/Users/ai/Desktop/可转债多因子/data/data_loader.py)
   - 为 `get_cb_daily_cross_section(...)` 增加 `columns` 参数
   - 因缓存分片已标准化，拼接后不再重复做整段 `standardize`
-- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/scoring_exports.py)
+- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/exports/scoring_exports.py)
   - 因子打分链路按 `FactorEngine.HISTORY_COLUMNS` 读取 `cb_daily_cross_section`
   - `ytm` 回写不再复用精简列面板
 
@@ -157,3 +157,4 @@
 - 当前阶段继续往下压性能，最值得评估的是：
   - 是否将 `cb_daily_cross_section` 从按日 CSV 升级为聚合缓存
   - 是否在单次运行内引入轻量内存缓存，减少重复读盘
+

@@ -1,4 +1,4 @@
-# 2026-04-21 cb_daily_cross_section 聚合缓存方案
+﻿# 2026-04-21 cb_daily_cross_section 聚合缓存方案
 
 ## 1. 背景
 
@@ -123,7 +123,7 @@ metadata 至少记录：
 
 ## 8. 对因子打分链路的接入方式
 
-在 [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/scoring_exports.py) 中：
+在 [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/exports/scoring_exports.py) 中：
 
 - `build_factor_score_report(...)` 调用 `get_cb_daily_cross_section(...)` 时：
   - 继续传 `columns=list(engine.HISTORY_COLUMNS)`
@@ -162,7 +162,7 @@ metadata 至少记录：
 - [data/data_loader.py](C:/Users/ai/Desktop/可转债多因子/data/data_loader.py)
   - `get_cb_daily_cross_section(...)` 支持 `aggregate_profile`
   - 为 `cb_daily_cross_section` 增加按月聚合缓存命中与按需物化逻辑
-- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/scoring_exports.py)
+- [scoring_exports.py](C:/Users/ai/Desktop/可转债多因子/exports/scoring_exports.py)
   - 因子打分链路接入 `factor_history_v1`
 
 测试结果：
@@ -189,3 +189,4 @@ metadata 至少记录：
 - 下一阶段如果继续优化，最值得评估的是：
   - 是否把 `factor_history_v1` 扩展为更多稳定 profile
   - 是否增加单次运行内的内存缓存，继续减少聚合分片的重复解析
+

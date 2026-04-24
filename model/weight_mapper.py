@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-from strategy_config import ModelParameters, load_strategy_parameters
+from config.strategy_config import ModelParameters, load_strategy_parameters
 
 
 FACTOR_NAMES = ("value", "carry", "structure", "trend", "stability")

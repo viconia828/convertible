@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
 from env.macro_alignment import MacroAlignmentSummary
-from reporting_semantics import DATA_QUALITY_STATUS_OK, DEFAULT_FETCH_POLICY
+from shared.reporting_semantics import DATA_QUALITY_STATUS_OK, DEFAULT_FETCH_POLICY
 
 
 @dataclass(frozen=True)
@@ -18,11 +18,14 @@ class StrategyDiagnostics:
     history_start_used: pd.Timestamp
     fetch_policy: str = DEFAULT_FETCH_POLICY
     refresh_requested: bool = False
+    runtime_snapshot_reused: bool = False
+    requested_codes: tuple[str, ...] = ()
     data_quality_status: str = DATA_QUALITY_STATUS_OK
     data_quality_hints: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
     alignment_summary: MacroAlignmentSummary | None = None
     first_fully_ready_trade_date: pd.Timestamp | None = None
+    cache_diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

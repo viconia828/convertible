@@ -24,6 +24,40 @@ def make_case_dir(case_name: str) -> Path:
 
 
 class DataCacheServiceTests(unittest.TestCase):
+    def test_observability_snapshot_summarizes_unified_metrics(self) -> None:
+        case_dir = make_case_dir("cache_service_observability_summary")
+        cache_store = CacheStore(case_dir / "cache")
+        service = DataCacheService(cache_store=cache_store, source_name="tushare")
+
+        service.record_cache_resolution("hit", "cb_daily")
+        service.record_cache_resolution("partial_hit", "cb_daily")
+        service.record_cache_resolution("refresh_bypass", "cb_daily")
+        service.record_file_scan("cb_daily", value=3)
+        service.record_remote_fill("cb_daily", value=2)
+        service.record_writeback("cb_daily", value=4)
+        service.record_stage_timing(
+            "remote_fetch",
+            0.012,
+            dataset_name="cb_daily",
+        )
+
+        summary = service.observability_snapshot()
+
+        self.assertEqual(int(summary["cache_hits"]), 1)
+        self.assertEqual(int(summary["cache_partial_hits"]), 1)
+        self.assertEqual(int(summary["cache_refresh_bypass"]), 1)
+        self.assertEqual(int(summary["file_scans"]), 3)
+        self.assertEqual(int(summary["remote_fills"]), 2)
+        self.assertEqual(int(summary["writebacks"]), 4)
+        self.assertGreaterEqual(
+            int(summary["stage_elapsed_ms"]["cb_daily::remote_fetch"]),
+            1,
+        )
+        self.assertEqual(
+            int(summary["stage_calls"]["cb_daily::remote_fetch"]),
+            1,
+        )
+
     def test_request_panel_runtime_memory_cache_hits_after_first_save(self) -> None:
         case_dir = make_case_dir("cache_service_request_panel_memory")
         cache_store = CacheStore(case_dir / "cache")
@@ -105,6 +139,7 @@ class DataCacheServiceTests(unittest.TestCase):
                 "covered_trade_days": ["20260401"],
                 "projection_columns": ["cb_code", "trade_date", "close", "amount"],
             },
+            standardized_name="cb_daily",
         )
         panel = DataSchema.standardize(
             "cb_daily",
@@ -323,15 +358,19 @@ class DataCacheServiceTests(unittest.TestCase):
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(
             json.dumps(
-                {
-                    "covered_trade_days": ["20260401", "20260402"],
-                    "projection_columns": [
+                service.build_time_series_aggregate_metadata_payload(
+                    dataset_name="cb_daily_cross_section",
+                    profile="factor_history_v1",
+                    partition_key="202604",
+                    covered_trade_days=["20260401", "20260402"],
+                    projection_columns=[
                         "cb_code",
                         "trade_date",
                         "close",
                         "amount",
                     ],
-                },
+                    standardized_name="cb_daily",
+                ),
                 ensure_ascii=True,
                 indent=2,
             ),
@@ -342,6 +381,7 @@ class DataCacheServiceTests(unittest.TestCase):
             dataset_name="cb_daily_cross_section",
             profile="factor_history_v1",
             partition_key="202604",
+            standardized_name="cb_daily",
         )
         assert loaded is not None
         self.assertEqual(loaded["covered_trade_days"], ["20260401", "20260402"])
@@ -350,6 +390,7 @@ class DataCacheServiceTests(unittest.TestCase):
             dataset_name="cb_daily_cross_section",
             profile="factor_history_v1",
             partition_key="202604",
+            standardized_name="cb_daily",
         )
 
         assert reloaded is not None
@@ -371,12 +412,14 @@ class DataCacheServiceTests(unittest.TestCase):
                 "covered_trade_days": ["20260401"],
                 "projection_columns": ["cb_code", "trade_date", "close"],
             },
+            standardized_name="cb_daily",
         )
 
         first = service.load_time_series_aggregate_metadata(
             dataset_name="cb_daily_cross_section",
             profile="factor_history_v1",
             partition_key="202604",
+            standardized_name="cb_daily",
         )
         assert first is not None
         self.assertEqual(first["covered_trade_days"], ["20260401"])
@@ -389,12 +432,14 @@ class DataCacheServiceTests(unittest.TestCase):
                 "covered_trade_days": ["20260401", "20260402"],
                 "projection_columns": ["cb_code", "trade_date", "close", "amount"],
             },
+            standardized_name="cb_daily",
         )
 
         reloaded = service.load_time_series_aggregate_metadata(
             dataset_name="cb_daily_cross_section",
             profile="factor_history_v1",
             partition_key="202604",
+            standardized_name="cb_daily",
         )
 
         assert reloaded is not None
@@ -449,6 +494,14 @@ class DataCacheServiceTests(unittest.TestCase):
             int(service.stats_snapshot()["grouped_time_series_file_reads::cb_rate"]),
             3,
         )
+        self.assertEqual(
+            int(service.stats_snapshot()["cache_file_scan_calls"]),
+            3,
+        )
+        self.assertEqual(
+            int(service.stats_snapshot()["cache_file_scan_calls::cb_rate"]),
+            3,
+        )
 
     def test_time_series_coverage_round_trip(self) -> None:
         case_dir = make_case_dir("cache_service_coverage")
@@ -478,6 +531,74 @@ class DataCacheServiceTests(unittest.TestCase):
                 pd.Timestamp("2026-04-09"),
             )
         )
+
+    def test_runtime_content_generation_increments_on_write_paths(self) -> None:
+        case_dir = make_case_dir("cache_service_runtime_content_generation")
+        cache_store = CacheStore(case_dir / "cache")
+        service = DataCacheService(cache_store=cache_store, source_name="tushare")
+
+        self.assertEqual(service.runtime_content_generation(), 0)
+
+        service.save_time_series(
+            dataset_name="cb_daily_cross_section",
+            cache_key="20260401",
+            frame=pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "trade_date": "2026-04-01",
+                        "close": 101.0,
+                        "amount": 20.0,
+                        "premium_rate": 3.0,
+                        "ytm": pd.NA,
+                        "convert_value": 95.0,
+                        "is_tradable": True,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(service.runtime_content_generation(), 1)
+
+        service.save_time_series_coverage(
+            dataset_name="cb_call",
+            cache_key="ALL",
+            start_ts=pd.Timestamp("2026-04-01"),
+            end_ts=pd.Timestamp("2026-04-10"),
+        )
+        self.assertEqual(service.runtime_content_generation(), 2)
+
+        service.save_time_series_aggregate_metadata(
+            dataset_name="cb_daily_cross_section",
+            profile="factor_history_v1",
+            partition_key="202604",
+            payload={
+                "covered_trade_days": ["20260401"],
+                "projection_columns": ["cb_code", "trade_date", "close", "amount"],
+            },
+            standardized_name="cb_daily",
+        )
+        self.assertEqual(service.runtime_content_generation(), 3)
+
+    def test_time_series_coverage_missing_governance_is_rejected(self) -> None:
+        case_dir = make_case_dir("cache_service_coverage_missing_governance")
+        cache_store = CacheStore(case_dir / "cache")
+        service = DataCacheService(cache_store=cache_store, source_name="tushare")
+
+        metadata_path = service.time_series_coverage_path("cb_call", "ALL")
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "start": "2026-04-01",
+                    "end": "2026-04-10",
+                },
+                ensure_ascii=True,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertIsNone(service.load_time_series_coverage("cb_call", "ALL"))
 
     def test_time_series_aggregate_round_trip_and_trade_day_coverage(self) -> None:
         case_dir = make_case_dir("cache_service_aggregate")
@@ -517,6 +638,7 @@ class DataCacheServiceTests(unittest.TestCase):
                     "amount",
                 ],
             },
+            standardized_name="cb_daily",
         )
 
         loaded = service.load_time_series_aggregate(
@@ -530,6 +652,7 @@ class DataCacheServiceTests(unittest.TestCase):
             dataset_name="cb_daily_cross_section",
             profile="factor_history_v1",
             partition_key="202604",
+            standardized_name="cb_daily",
         )
 
         self.assertIsNotNone(loaded)
@@ -542,6 +665,77 @@ class DataCacheServiceTests(unittest.TestCase):
         )
         self.assertFalse(
             service.covers_aggregate_trade_days(metadata, ["20260401", "20260403"])
+        )
+
+    def test_time_series_aggregate_metadata_missing_governance_is_rejected(self) -> None:
+        case_dir = make_case_dir("cache_service_aggregate_metadata_missing_governance")
+        cache_store = CacheStore(case_dir / "cache")
+        service = DataCacheService(cache_store=cache_store, source_name="tushare")
+
+        metadata_path = service.time_series_aggregate_metadata_path(
+            dataset_name="cb_daily_cross_section",
+            profile="factor_history_v1",
+            partition_key="202604",
+        )
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "covered_trade_days": ["20260401", "20260402"],
+                    "projection_columns": ["cb_code", "trade_date", "close", "amount"],
+                },
+                ensure_ascii=True,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertIsNone(
+            service.load_time_series_aggregate_metadata(
+                dataset_name="cb_daily_cross_section",
+                profile="factor_history_v1",
+                partition_key="202604",
+                standardized_name="cb_daily",
+                requested_columns=("cb_code", "trade_date", "close", "amount"),
+            )
+        )
+
+    def test_time_series_aggregate_metadata_projection_signature_mismatch_is_rejected(
+        self,
+    ) -> None:
+        case_dir = make_case_dir("cache_service_aggregate_metadata_projection_mismatch")
+        cache_store = CacheStore(case_dir / "cache")
+        service = DataCacheService(cache_store=cache_store, source_name="tushare")
+
+        payload = service.build_time_series_aggregate_metadata_payload(
+            dataset_name="cb_daily_cross_section",
+            profile="factor_history_v1",
+            partition_key="202604",
+            covered_trade_days=["20260401", "20260402"],
+            projection_columns=["cb_code", "trade_date", "close", "amount"],
+            standardized_name="cb_daily",
+        )
+        assert isinstance(payload.get("governance"), dict)
+        payload["governance"]["projection_signature"] = "stale_signature"
+        metadata_path = service.time_series_aggregate_metadata_path(
+            dataset_name="cb_daily_cross_section",
+            profile="factor_history_v1",
+            partition_key="202604",
+        )
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+
+        self.assertIsNone(
+            service.load_time_series_aggregate_metadata(
+                dataset_name="cb_daily_cross_section",
+                profile="factor_history_v1",
+                partition_key="202604",
+                standardized_name="cb_daily",
+                requested_columns=("cb_code", "trade_date", "close", "amount"),
+            )
         )
 
     def test_writeback_derived_fields_only_fills_missing_values(self) -> None:
@@ -619,6 +813,10 @@ class DataCacheServiceTests(unittest.TestCase):
         self.assertAlmostEqual(float(filled["110001.SH"]), 0.052, places=6)
         self.assertAlmostEqual(float(filled["110002.SH"]), 0.031, places=6)
         self.assertEqual(service.stats_snapshot()["derived_writeback_files"], 1)
+        self.assertEqual(
+            int(service.stats_snapshot()["cache_writeback_calls::cb_daily_cross_section"]),
+            1,
+        )
 
     def test_inspect_local_env_history_start_uses_latest_required_start(self) -> None:
         case_dir = make_case_dir("cache_service_env_history_start")

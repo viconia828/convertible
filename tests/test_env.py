@@ -14,6 +14,11 @@ class EnvironmentDetectorTests(unittest.TestCase):
 
         self.assertEqual(detector.recommended_export_warmup_observation_count(), 20)
 
+    def test_recommended_history_buffer_observation_count_defaults_to_80(self) -> None:
+        detector = EnvironmentDetector()
+
+        self.assertEqual(detector.recommended_history_buffer_observation_count(), 80)
+
     def test_compute_with_warmup_identifies_first_fully_ready_trade_date(self) -> None:
         dates = pd.date_range("2024-01-01", periods=160, freq="B")
         macro_daily = pd.DataFrame(

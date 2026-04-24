@@ -285,6 +285,19 @@ class DataLoaderTests(unittest.TestCase):
         cb_daily_calls = [call for call in client.calls if call[0] == "cb_daily"]
         self.assertEqual(len(cb_daily_calls), 1)
         self.assertEqual(cb_daily_calls[0][1]["ts_code"], "110002.SH")
+        stats = loader.cache_service.stats_snapshot()
+        self.assertEqual(
+            int(stats.get("cache_resolution_partial_hit_calls::cb_daily", 0)),
+            1,
+        )
+        self.assertEqual(
+            int(stats.get("remote_fill_calls::cb_daily", 0)),
+            1,
+        )
+        self.assertGreaterEqual(
+            int(stats.get("stage_elapsed_ms::cb_daily::remote_fetch", 0)),
+            1,
+        )
 
     def test_cb_daily_can_enrich_premium_and_ytm(self) -> None:
         client = FakeTushareClient(
@@ -415,6 +428,15 @@ class DataLoaderTests(unittest.TestCase):
         cb_rate_calls = [call for call in client.calls if call[0] == "cb_rate"]
         self.assertEqual(len(cb_rate_calls), 1)
         self.assertEqual(cb_rate_calls[0][1]["ts_code"], "110002.SH")
+        stats = loader.cache_service.stats_snapshot()
+        self.assertEqual(
+            int(stats.get("cache_resolution_partial_hit_calls::cb_rate", 0)),
+            1,
+        )
+        self.assertEqual(
+            int(stats.get("remote_fill_calls::cb_rate", 0)),
+            1,
+        )
 
     def test_cb_rate_can_batch_load_cached_codes_without_remote_calls(self) -> None:
         client = FakeTushareClient(
@@ -839,6 +861,19 @@ class DataLoaderTests(unittest.TestCase):
         cb_daily_calls = [call for call in client.calls if call[0] == "cb_daily"]
         self.assertEqual(len(cb_daily_calls), 1)
         self.assertEqual(cb_daily_calls[0][1]["trade_date"], "20260402")
+        stats = loader.cache_service.stats_snapshot()
+        self.assertEqual(
+            int(stats.get("cache_resolution_partial_hit_calls::cb_daily_cross_section", 0)),
+            1,
+        )
+        self.assertEqual(
+            int(stats.get("remote_fill_calls::cb_daily_cross_section", 0)),
+            1,
+        )
+        self.assertGreaterEqual(
+            int(stats.get("stage_elapsed_ms::cb_daily_cross_section::remote_fetch", 0)),
+            1,
+        )
 
     def test_cb_daily_cross_section_can_batch_load_cached_days_without_remote_calls(self) -> None:
         client = FakeTushareClient(
@@ -1056,6 +1091,24 @@ class DataLoaderTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertGreaterEqual(
+            int(
+                loader.cache_service.stats_snapshot().get(
+                    "cache_resolution_hit_calls::cb_daily_cross_section::factor_history_v1",
+                    0,
+                )
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            int(
+                loader.cache_service.stats_snapshot().get(
+                    "stage_elapsed_ms::cb_daily_cross_section::factor_history_v1::request_panel_lookup",
+                    0,
+                )
+            ),
+            1,
+        )
 
     def test_cb_daily_cross_section_writeback_invalidates_aggregate_and_request_panel(self) -> None:
         client = FakeTushareClient(
@@ -1158,6 +1211,114 @@ class DataLoaderTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_cb_daily_cross_section_rebuilds_aggregate_when_projection_changes(self) -> None:
+        client = FakeTushareClient(
+            {
+                "trade_cal": pd.DataFrame(
+                    [
+                        {"exchange": "SSE", "cal_date": "20260401", "is_open": 1, "pretrade_date": "20260331"},
+                        {"exchange": "SSE", "cal_date": "20260402", "is_open": 1, "pretrade_date": "20260401"},
+                    ]
+                ),
+                "cb_daily": pd.DataFrame(columns=["ts_code", "trade_date"]),
+            }
+        )
+
+        case_dir = make_case_dir("cb_daily_cross_section_projection_rebuild")
+        loader = DataLoader(cache_dir=case_dir / "cache", client=client)
+        loader.CB_DAILY_CROSS_SECTION_BATCH_CACHE_THRESHOLD = 2
+        loader.CB_DAILY_CROSS_SECTION_AGGREGATE_MIN_DAYS = 2
+        requested_columns = [
+            "cb_code",
+            "trade_date",
+            "close",
+            "amount",
+            "premium_rate",
+            "ytm",
+            "convert_value",
+            "is_tradable",
+        ]
+
+        for trade_date, code, close in [
+            ("2026-04-01", "110001.SH", 101.0),
+            ("2026-04-02", "110002.SH", 102.0),
+        ]:
+            loader.cache_store.save_time_series(
+                loader.source_name,
+                "cb_daily_cross_section",
+                trade_date.replace("-", ""),
+                pd.DataFrame(
+                    [
+                        {
+                            "cb_code": code,
+                            "trade_date": trade_date,
+                            "close": close,
+                            "amount": 20.0,
+                            "premium_rate": 3.0,
+                            "ytm": pd.NA,
+                            "convert_value": 95.0,
+                            "is_tradable": True,
+                        }
+                    ]
+                ),
+            )
+
+        loader.cache_store.save_time_series_aggregate(
+            loader.source_name,
+            "cb_daily_cross_section",
+            "factor_history_v1",
+            "202604",
+            pd.DataFrame(
+                [
+                    {
+                        "cb_code": "110001.SH",
+                        "trade_date": "2026-04-01",
+                        "close": 999.0,
+                    },
+                    {
+                        "cb_code": "110002.SH",
+                        "trade_date": "2026-04-02",
+                        "close": 999.0,
+                    },
+                ]
+            ),
+        )
+        loader.cache_service.save_time_series_aggregate_metadata(
+            dataset_name="cb_daily_cross_section",
+            profile="factor_history_v1",
+            partition_key="202604",
+            payload={
+                "covered_trade_days": ["20260401", "20260402"],
+                "projection_columns": ["cb_code", "trade_date", "close"],
+            },
+            standardized_name="cb_daily",
+        )
+
+        frame = loader.get_cb_daily_cross_section(
+            "2026-04-01",
+            "2026-04-02",
+            columns=requested_columns,
+            aggregate_profile="factor_history_v1",
+        )
+
+        by_code = frame.set_index("cb_code")
+        self.assertEqual(list(frame.columns), requested_columns)
+        self.assertAlmostEqual(float(by_code.loc["110001.SH", "close"]), 101.0, places=6)
+        self.assertAlmostEqual(float(by_code.loc["110002.SH", "close"]), 102.0, places=6)
+        self.assertAlmostEqual(float(by_code.loc["110001.SH", "amount"]), 20.0, places=6)
+        self.assertEqual(len([call for call in client.calls if call[0] == "cb_daily"]), 0)
+
+        metadata = loader.cache_service.load_time_series_aggregate_metadata(
+            dataset_name="cb_daily_cross_section",
+            profile="factor_history_v1",
+            partition_key="202604",
+            standardized_name="cb_daily",
+            requested_columns=requested_columns,
+        )
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["projection_columns"], requested_columns)
 
     def test_cb_equal_weight_index_refetches_when_cached_dates_have_gap(self) -> None:
         client = FakeTushareClient(

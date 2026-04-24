@@ -9,12 +9,12 @@ import pandas as pd
 from env import EnvironmentDetector
 from factor import FactorEngine
 from model import WeightMapper
-from reporting_semantics import (
+from config.strategy_config import StrategyParameters, load_strategy_parameters
+from shared.reporting_semantics import (
     DATA_QUALITY_STATUS_OK,
     build_data_quality_warning_note,
     resolve_data_quality_status,
 )
-from strategy_config import StrategyParameters, load_strategy_parameters
 
 from .portfolio import PortfolioBuilder
 from .result import StrategyDecision, StrategyDiagnostics
@@ -62,12 +62,51 @@ class StrategyEngine:
             .astype("float64")
             .to_dict()
         )
+        current_codes: list[str] = []
+        if {
+            "trade_date",
+            "cb_code",
+        }.issubset(snapshot.cb_daily.columns):
+            current_codes = (
+                snapshot.cb_daily.loc[
+                    snapshot.cb_daily["trade_date"].eq(snapshot.trade_date),
+                    "cb_code",
+                ]
+                .dropna()
+                .astype(str)
+                .drop_duplicates()
+                .tolist()
+            )
+        factor_cb_daily = snapshot.cb_daily
+        factor_cb_basic = snapshot.cb_basic
+        factor_cb_call = snapshot.cb_call
+        factor_cb_rate = snapshot.cb_rate
+        if current_codes:
+            factor_cb_daily = snapshot.cb_daily.loc[
+                snapshot.cb_daily["cb_code"].isin(current_codes)
+            ].copy()
+            if not snapshot.cb_basic.empty and "cb_code" in snapshot.cb_basic.columns:
+                factor_cb_basic = snapshot.cb_basic.loc[
+                    snapshot.cb_basic["cb_code"].isin(current_codes)
+                ].copy()
+            if not snapshot.cb_call.empty and "cb_code" in snapshot.cb_call.columns:
+                factor_cb_call = snapshot.cb_call.loc[
+                    snapshot.cb_call["cb_code"].isin(current_codes)
+                ].copy()
+            if (
+                snapshot.cb_rate is not None
+                and not snapshot.cb_rate.empty
+                and "cb_code" in snapshot.cb_rate.columns
+            ):
+                factor_cb_rate = snapshot.cb_rate.loc[
+                    snapshot.cb_rate["cb_code"].isin(current_codes)
+                ].copy()
         factor_diagnostics = self.factor_engine.compute_with_diagnostics(
             as_of_date=snapshot.trade_date,
-            cb_daily=snapshot.cb_daily,
-            cb_basic=snapshot.cb_basic,
-            cb_call=snapshot.cb_call,
-            cb_rate=snapshot.cb_rate,
+            cb_daily=factor_cb_daily,
+            cb_basic=factor_cb_basic,
+            cb_call=factor_cb_call,
+            cb_rate=factor_cb_rate,
         )
         factor_weights = self.weight_mapper.compute(env_values)
         scored = self.factor_engine.append_weighted_total_score(
@@ -113,11 +152,14 @@ class StrategyEngine:
             history_start_requested=snapshot.history_window.requested_start,
             history_start_used=snapshot.history_window.used_start,
             refresh_requested=snapshot.refresh_requested,
+            runtime_snapshot_reused=snapshot.runtime_snapshot_reused,
+            requested_codes=snapshot.requested_codes,
             data_quality_status=data_quality_status,
             data_quality_hints=snapshot.data_quality_hints,
             notes=tuple(notes),
             alignment_summary=alignment_summary,
             first_fully_ready_trade_date=computation.first_fully_ready_trade_date,
+            cache_diagnostics=snapshot.cache_diagnostics,
         )
         return StrategyDecision(
             trade_date=snapshot.trade_date,

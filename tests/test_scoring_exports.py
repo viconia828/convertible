@@ -7,8 +7,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from config.strategy_config import load_strategy_parameters
 from factor import FactorEngine
-from scoring_exports import (
+from exports.scoring_exports import (
     FACTOR_DIAGNOSTIC_EXPORT_COLUMNS,
     FACTOR_SCORE_DISPLAY_COLUMNS,
     _build_factor_code_sheet_name_map,
@@ -19,7 +20,6 @@ from scoring_exports import (
     write_environment_score_xlsx,
     write_factor_score_xlsx,
 )
-from strategy_config import load_strategy_parameters
 
 
 TMP_ROOT = Path(__file__).resolve().parent / "_tmp"
